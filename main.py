@@ -50,6 +50,7 @@ logger.info("  PHONE_NUMBER_ID : %s", PHONE_NUMBER_ID or "(MISSING ❌)")
 logger.info("  WHATSAPP_TOKEN  : %s", "SET ✅" if WHATSAPP_TOKEN else "(MISSING ❌)")
 logger.info("  GROQ_API_KEY    : %s", "SET ✅" if GROQ_API_KEY else "(MISSING ❌)")
 logger.info("  GROQ_MODEL      : %s", GROQ_MODEL)
+logger.info("  CURRENT IST     : %s", datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"))
 logger.info("=" * 60)
 
 # ── Import Groq ───────────────────────────────────────────────────────────────
@@ -70,11 +71,11 @@ app = FastAPI(title="WhatsApp AI Bot with Reminders")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DATABASE — SQLite for reminders
+# All times stored as IST in "YYYY-MM-DD HH:MM:SS" format
 # ─────────────────────────────────────────────────────────────────────────────
 DB_FILE = "reminders.db"
 
 def init_db():
-    """Create reminders table if it doesn't exist"""
     conn = sqlite3.connect(DB_FILE)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS reminders (
@@ -91,62 +92,76 @@ def init_db():
     logger.info("Database initialized ✅")
 
 def save_reminder(phone: str, task: str, remind_at: datetime):
-    """Save reminder to database"""
+    """
+    Save reminder. remind_at must be a datetime (naive or aware).
+    We always store as IST string.
+    """
+    # If naive, assume it's already IST
+    if remind_at.tzinfo is None:
+        remind_at_ist = remind_at.replace(tzinfo=IST)
+    else:
+        remind_at_ist = remind_at.astimezone(IST)
+
+    remind_at_str = remind_at_ist.strftime("%Y-%m-%d %H:%M:%S")
+
     conn = sqlite3.connect(DB_FILE)
     conn.execute(
         "INSERT INTO reminders (phone, task, remind_at) VALUES (?, ?, ?)",
-        (phone, task, remind_at.strftime("%Y-%m-%d %H:%M:%S"))
+        (phone, task, remind_at_str)
     )
     conn.commit()
     conn.close()
-    logger.info("[DB] Reminder saved: %s at %s for %s", task, remind_at, phone)
+    logger.info("[DB] Reminder saved: '%s' at %s (IST) for %s", task, remind_at_str, phone)
 
 def get_due_reminders():
-    """Get all reminders that are due and not sent"""
+    """
+    Get all reminders due at or before right now (IST).
+    Compares full datetime strings — no truncation bugs.
+    """
     conn = sqlite3.connect(DB_FILE)
-    now = datetime.now(IST).strftime("%Y-%m-%d %H:%M")
+    now_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+    logger.debug("[SCHEDULER] Checking due reminders. Now (IST): %s", now_str)
     rows = conn.execute(
-        "SELECT id, phone, task FROM reminders WHERE remind_at <= ? AND sent = 0",
-        (now,)
+        "SELECT id, phone, task, remind_at FROM reminders WHERE remind_at <= ? AND sent = 0",
+        (now_str,)
     ).fetchall()
     conn.close()
     return rows
 
 def mark_sent(reminder_id: int):
-    """Mark reminder as sent"""
     conn = sqlite3.connect(DB_FILE)
     conn.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (reminder_id,))
     conn.commit()
     conn.close()
 
-# Initialize database on startup
+# Initialize DB on startup
 init_db()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REMINDER SCHEDULER — runs every 30 seconds in background
+# REMINDER SCHEDULER — background thread, runs every 30 seconds
 # ─────────────────────────────────────────────────────────────────────────────
 def reminder_scheduler():
-    """Background thread that checks and sends due reminders every 30 seconds"""
     logger.info("[SCHEDULER] Started ✅")
     while True:
         try:
             due = get_due_reminders()
-            for reminder_id, phone, task in due:
+            if due:
+                logger.info("[SCHEDULER] Found %d due reminder(s)", len(due))
+            for reminder_id, phone, task, remind_at in due:
                 try:
                     send_whatsapp_text(
                         phone_number=phone,
                         message=f"⏰ *Reminder:* {task}"
                     )
                     mark_sent(reminder_id)
-                    logger.info("[SCHEDULER] ✅ Sent reminder to %s: %s", phone, task)
+                    logger.info("[SCHEDULER] ✅ Sent reminder #%d to %s: %s", reminder_id, phone, task)
                 except Exception as e:
-                    logger.error("[SCHEDULER] Failed to send reminder: %s", e)
+                    logger.error("[SCHEDULER] ❌ Failed to send reminder #%d: %s", reminder_id, e)
         except Exception as e:
-            logger.error("[SCHEDULER] Error: %s", e)
-        time.sleep(30)  # check every 30 seconds
+            logger.error("[SCHEDULER] ❌ Loop error: %s", e)
+        time.sleep(30)
 
-# Start scheduler in background thread
 scheduler_thread = threading.Thread(target=reminder_scheduler, daemon=True)
 scheduler_thread.start()
 logger.info("[SCHEDULER] Background thread started ✅")
@@ -157,25 +172,32 @@ logger.info("[SCHEDULER] Background thread started ✅")
 # ─────────────────────────────────────────────────────────────────────────────
 def parse_reminder_with_ai(message: str) -> dict | None:
     """
-    Use Groq AI to understand reminder from natural language.
-    Returns dict with 'task' and 'remind_at' or None if not a reminder.
+    Use Groq AI to parse natural language reminder.
+    Returns dict with 'task' and 'remind_at' (YYYY-MM-DD HH:MM) or None.
     """
     try:
-        now = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-        prompt = f"""Current date and time: {now}
+        now_ist = datetime.now(IST)
+        now_str = now_ist.strftime("%Y-%m-%d %H:%M:%S")
+
+        prompt = f"""Current date and time (IST, Asia/Kolkata): {now_str}
 
 User message: "{message}"
 
 Is this a reminder request? Extract the details.
 
-Reply ONLY in this exact JSON format with no other text:
+Reply ONLY in this exact JSON format with absolutely no other text, no markdown, no explanation:
+
 If it IS a reminder:
 {{"is_reminder": true, "task": "the task description", "remind_at": "YYYY-MM-DD HH:MM"}}
 
 If it is NOT a reminder:
 {{"is_reminder": false}}
 
-Important: Use 24-hour time format. Calculate exact date for "tomorrow", "in 2 hours", "next Monday" etc based on current time."""
+Rules:
+- Use 24-hour time format for remind_at
+- Calculate the exact date/time for relative phrases like "tomorrow", "in 2 hours", "next Monday", "at 5pm" based on the current IST time above
+- The remind_at must be in the future relative to the current time
+- task should be a clean description of what to remind about"""
 
         response = groq_client.chat.completions.create(
             model=GROQ_MODEL,
@@ -185,12 +207,15 @@ Important: Use 24-hour time format. Calculate exact date for "tomorrow", "in 2 h
         )
 
         text = response.choices[0].message.content.strip()
-        # Clean any markdown formatting
+        # Strip any markdown code fences
         text = text.replace("```json", "").replace("```", "").strip()
         data = json.loads(text)
         logger.info("[REMINDER_PARSER] Parsed: %s", data)
         return data
 
+    except json.JSONDecodeError as e:
+        logger.error("[REMINDER_PARSER] JSON parse error: %s | Raw: %s", e, text)
+        return None
     except Exception as e:
         logger.error("[REMINDER_PARSER] Error: %s", e)
         return None
@@ -200,7 +225,6 @@ Important: Use 24-hour time format. Calculate exact date for "tomorrow", "in 2 h
 # AI REPLY USING GROQ
 # ─────────────────────────────────────────────────────────────────────────────
 def generate_ai_reply(prompt: str, sender: str) -> str:
-    """Generate AI reply, handling reminders specially"""
     logger.info("[AI] Message from %s: %s", sender, prompt[:120])
 
     if not GROQ_API_KEY:
@@ -213,8 +237,10 @@ def generate_ai_reply(prompt: str, sender: str) -> str:
 
     try:
         # ── Check if this is a reminder request ──────────────────────────────
-        reminder_keywords = ["remind", "reminder", "alert", "notify", "don't forget",
-                           "याद", "याद दिलाओ", "रिमाइंडर"]
+        reminder_keywords = [
+            "remind", "reminder", "alert", "notify", "don't forget",
+            "याद", "याद दिलाओ", "रिमाइंडर", "set a reminder", "set reminder"
+        ]
         is_likely_reminder = any(kw in prompt.lower() for kw in reminder_keywords)
 
         if is_likely_reminder:
@@ -224,22 +250,41 @@ def generate_ai_reply(prompt: str, sender: str) -> str:
             if reminder_data and reminder_data.get("is_reminder"):
                 try:
                     task = reminder_data.get("task", prompt)
-                    remind_at_str = reminder_data.get("remind_at")
-                    remind_at = datetime.strptime(remind_at_str, "%Y-%m-%d %H:%M")
+                    remind_at_str = reminder_data.get("remind_at")  # "YYYY-MM-DD HH:MM"
 
-                    save_reminder(
-                        phone=sender,
-                        task=task,
-                        remind_at=remind_at
+                    # Parse as naive datetime, then attach IST timezone
+                    remind_at_naive = datetime.strptime(remind_at_str, "%Y-%m-%d %H:%M")
+                    remind_at_ist   = remind_at_naive.replace(tzinfo=IST)
+
+                    # Validate it's in the future
+                    now_ist = datetime.now(IST)
+                    if remind_at_ist <= now_ist:
+                        logger.warning("[AI] Reminder time is in the past: %s", remind_at_ist)
+                        return (
+                            "⚠️ That time seems to be in the past! "
+                            "Please give me a future time for the reminder."
+                        )
+
+                    save_reminder(phone=sender, task=task, remind_at=remind_at_ist)
+
+                    formatted = remind_at_ist.strftime("%d %b %Y at %I:%M %p IST")
+                    logger.info("[AI] ✅ Reminder saved for %s", formatted)
+                    return (
+                        f"✅ *Reminder set!*\n"
+                        f"📋 Task: {task}\n"
+                        f"⏰ Time: {formatted}\n\n"
+                        f"I'll remind you then!"
                     )
 
-                    formatted = remind_at.strftime("%d %b %Y at %I:%M %p")
-                    logger.info("[AI] ✅ Reminder saved for %s", formatted)
-                    return f"✅ *Reminder set!*\n📋 Task: {task}\n⏰ Time: {formatted}\n\nI'll remind you then!"
-
+                except ValueError as e:
+                    logger.error("[AI] Failed to parse reminder datetime: %s", e)
+                    return (
+                        "Sorry, I couldn't understand that time. "
+                        "Try something like: _'Remind me tomorrow at 5pm to call John'_"
+                    )
                 except Exception as e:
                     logger.error("[AI] Failed to save reminder: %s", e)
-                    return "Sorry, I couldn't set that reminder. Please try again with a clearer time like 'remind me tomorrow at 5pm to call John'."
+                    return "Sorry, I couldn't set that reminder. Please try again."
 
         # ── Normal AI reply ───────────────────────────────────────────────────
         if sender not in conversation_history:
@@ -250,6 +295,7 @@ def generate_ai_reply(prompt: str, sender: str) -> str:
             "content": prompt
         })
 
+        # Keep last 10 messages for context
         recent = conversation_history[sender][-10:]
 
         response = groq_client.chat.completions.create(
@@ -257,12 +303,14 @@ def generate_ai_reply(prompt: str, sender: str) -> str:
             messages=[
                 {
                     "role": "system",
-                    "content": """You are a helpful and friendly WhatsApp assistant.
-- Keep replies short and clear (under 100 words)
-- Be conversational and warm
-- Reply in the same language the user writes in
-- You can set reminders when asked
-- Never make up false information"""
+                    "content": (
+                        "You are a helpful and friendly WhatsApp assistant.\n"
+                        "- Keep replies short and clear (under 100 words)\n"
+                        "- Be conversational and warm\n"
+                        "- Reply in the same language the user writes in\n"
+                        "- You can set reminders when asked\n"
+                        "- Never make up false information"
+                    )
                 },
                 *recent
             ],
@@ -300,7 +348,10 @@ def send_whatsapp_text(
     if not effective_phone_id:
         raise ValueError("PHONE_NUMBER_ID missing in .env")
 
-    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{effective_phone_id}/messages"
+    url = (
+        f"https://graph.facebook.com/{GRAPH_API_VERSION}"
+        f"/{effective_phone_id}/messages"
+    )
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json",
@@ -337,7 +388,7 @@ async def verify_webhook(request: Request):
         logger.info("[VERIFY] ✅ Webhook verified!")
         return PlainTextResponse(content=challenge, status_code=200)
 
-    logger.warning("[VERIFY] ❌ Token mismatch")
+    logger.warning("[VERIFY] ❌ Token mismatch. Got: %s", verify_token)
     raise HTTPException(status_code=403, detail="Verification token mismatch")
 
 
@@ -400,7 +451,10 @@ async def receive_message(payload: Dict[str, Any]):
                         except RuntimeError as e:
                             logger.error("[MSG] WhatsApp API error: %s", e)
                             if "401" in str(e):
-                                logger.error("[MSG] ❌ Token expired! Regenerate at developers.facebook.com")
+                                logger.error(
+                                    "[MSG] ❌ Token expired! "
+                                    "Regenerate at developers.facebook.com"
+                                )
                         except Exception as e:
                             logger.exception("[MSG] Send error: %s", e)
 
@@ -418,22 +472,34 @@ async def receive_message(payload: Dict[str, Any]):
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    # Count pending reminders
     conn = sqlite3.connect(DB_FILE)
-    pending = conn.execute("SELECT COUNT(*) FROM reminders WHERE sent = 0").fetchone()[0]
-    total   = conn.execute("SELECT COUNT(*) FROM reminders").fetchone()[0]
+    pending = conn.execute(
+        "SELECT COUNT(*) FROM reminders WHERE sent = 0"
+    ).fetchone()[0]
+    total = conn.execute(
+        "SELECT COUNT(*) FROM reminders"
+    ).fetchone()[0]
+    # Show next 5 pending reminders for debugging
+    upcoming = conn.execute(
+        "SELECT phone, task, remind_at FROM reminders WHERE sent = 0 ORDER BY remind_at LIMIT 5"
+    ).fetchall()
     conn.close()
 
     return {
-        "status"           : "ok ✅",
-        "groq_api_key"     : "SET ✅" if GROQ_API_KEY else "MISSING ❌",
-        "whatsapp_token"   : "SET ✅" if WHATSAPP_TOKEN else "MISSING ❌",
-        "phone_number_id"  : PHONE_NUMBER_ID or "MISSING ❌",
-        "groq_sdk"         : "OK ✅" if groq_client else "ERROR ❌",
-        "scheduler"        : "RUNNING ✅",
-        "reminders_pending": pending,
-        "reminders_total"  : total,
-        "users_in_memory"  : len(conversation_history),
+        "status"            : "ok ✅",
+        "current_time_ist"  : datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+        "groq_api_key"      : "SET ✅" if GROQ_API_KEY else "MISSING ❌",
+        "whatsapp_token"    : "SET ✅" if WHATSAPP_TOKEN else "MISSING ❌",
+        "phone_number_id"   : PHONE_NUMBER_ID or "MISSING ❌",
+        "groq_sdk"          : "OK ✅" if groq_client else "ERROR ❌",
+        "scheduler"         : "RUNNING ✅",
+        "reminders_pending" : pending,
+        "reminders_total"   : total,
+        "upcoming_reminders": [
+            {"phone": r[0], "task": r[1], "remind_at": r[2]}
+            for r in upcoming
+        ],
+        "users_in_memory"   : len(conversation_history),
     }
 
 
