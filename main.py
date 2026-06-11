@@ -15,6 +15,9 @@ import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+IST = ZoneInfo("Asia/Kolkata")
+
 from typing import Any, Dict
 
 from dotenv import load_dotenv
@@ -101,7 +104,7 @@ def save_reminder(phone: str, task: str, remind_at: datetime):
 def get_due_reminders():
     """Get all reminders that are due and not sent"""
     conn = sqlite3.connect(DB_FILE)
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(IST).strftime("%Y-%m-%d %H:%M")
     rows = conn.execute(
         "SELECT id, phone, task FROM reminders WHERE remind_at <= ? AND sent = 0",
         (now,)
@@ -158,7 +161,7 @@ def parse_reminder_with_ai(message: str) -> dict | None:
     Returns dict with 'task' and 'remind_at' or None if not a reminder.
     """
     try:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        now = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
         prompt = f"""Current date and time: {now}
 
 User message: "{message}"
