@@ -216,6 +216,31 @@ logger.info("[SCHEDULER] Background thread started ✅")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# KEEP-ALIVE — pings /health every 30s so Railway never sleeps
+# ─────────────────────────────────────────────────────────────────────────────
+RAILWAY_URL = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
+
+def keep_alive():
+    # Wait 10s on startup before first ping
+    time.sleep(10)
+    logger.info("[KEEPALIVE] Thread started ✅  url=%s", RAILWAY_URL or "(not set yet)")
+    while True:
+        if RAILWAY_URL:
+            try:
+                url = f"https://{RAILWAY_URL}/health"
+                resp = requests.get(url, timeout=10)
+                logger.info("[KEEPALIVE] ✅ Pinged %s → %s", url, resp.status_code)
+            except Exception as exc:
+                logger.warning("[KEEPALIVE] ⚠️ Ping failed: %s", exc)
+        else:
+            logger.warning("[KEEPALIVE] ⚠️ RAILWAY_PUBLIC_DOMAIN not set — skipping ping")
+        time.sleep(30)
+
+threading.Thread(target=keep_alive, daemon=True).start()
+logger.info("[KEEPALIVE] Background thread started ✅")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PARSE REMINDER WITH AI
 # ─────────────────────────────────────────────────────────────────────────────
 def parse_reminder_with_ai(message: str) -> dict | None:
