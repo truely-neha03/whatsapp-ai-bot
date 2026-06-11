@@ -1,10 +1,5 @@
 """
-WhatsApp AI Bot - FastAPI + Groq (Free AI) + Meta WhatsApp Cloud API
-
-Setup:
-1. pip install fastapi uvicorn python-dotenv requests groq
-2. Create .env file with your values
-3. Run: uvicorn main:app --reload --host 0.0.0.0 --port 8000
+WhatsApp AI Bot - FastAPI + Groq + Reminders + Meta WhatsApp Cloud API
 
 .env file:
 GROQ_API_KEY=gsk_xxxxxxxxxxxxxxxx
@@ -16,9 +11,12 @@ VERIFY_TOKEN=my_secret_token_123
 import os
 import json
 import logging
+import sqlite3
+import threading
+import time
+from datetime import datetime, timedelta
 from typing import Any, Dict
 
-# ── Load .env ────────────────────────────────────────────────────────────────
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -31,8 +29,7 @@ GROQ_API_KEY    = os.getenv("GROQ_API_KEY", "")
 WHATSAPP_TOKEN  = os.getenv("WHATSAPP_TOKEN", "")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "")
 VERIFY_TOKEN    = os.getenv("VERIFY_TOKEN", "my_secret_token_123")
-
-GROQ_MODEL        = "llama-3.3-70b-versatile"   # Free, fast, works great
+GROQ_MODEL      = "llama-3.3-70b-versatile"
 GRAPH_API_VERSION = "v25.0"
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -43,7 +40,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("whatsapp-bot")
 
-# ── Startup Diagnostics ──────────────────────────────────────────────────────
 logger.info("=" * 60)
 logger.info("STARTUP DIAGNOSTICS")
 logger.info("  VERIFY_TOKEN    : %s", VERIFY_TOKEN)
@@ -60,54 +56,199 @@ try:
     groq_client = Groq(api_key=GROQ_API_KEY)
     logger.info("Groq SDK : OK ✅")
 except ImportError:
-    logger.error("Groq SDK NOT installed!")
-    logger.error("Run: pip install groq")
+    logger.error("Groq SDK NOT installed! Run: pip install groq")
 
 # ── Conversation Memory ───────────────────────────────────────────────────────
-# Remembers last 10 messages per user phone number
 conversation_history: Dict[str, list] = {}
 
 # ── FastAPI App ───────────────────────────────────────────────────────────────
-app = FastAPI(title="WhatsApp AI Bot")
+app = FastAPI(title="WhatsApp AI Bot with Reminders")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATABASE — SQLite for reminders
+# ─────────────────────────────────────────────────────────────────────────────
+DB_FILE = "reminders.db"
+
+def init_db():
+    """Create reminders table if it doesn't exist"""
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT NOT NULL,
+            task TEXT NOT NULL,
+            remind_at TEXT NOT NULL,
+            sent INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+    logger.info("Database initialized ✅")
+
+def save_reminder(phone: str, task: str, remind_at: datetime):
+    """Save reminder to database"""
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute(
+        "INSERT INTO reminders (phone, task, remind_at) VALUES (?, ?, ?)",
+        (phone, task, remind_at.strftime("%Y-%m-%d %H:%M:%S"))
+    )
+    conn.commit()
+    conn.close()
+    logger.info("[DB] Reminder saved: %s at %s for %s", task, remind_at, phone)
+
+def get_due_reminders():
+    """Get all reminders that are due and not sent"""
+    conn = sqlite3.connect(DB_FILE)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = conn.execute(
+        "SELECT id, phone, task FROM reminders WHERE remind_at <= ? AND sent = 0",
+        (now,)
+    ).fetchall()
+    conn.close()
+    return rows
+
+def mark_sent(reminder_id: int):
+    """Mark reminder as sent"""
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (reminder_id,))
+    conn.commit()
+    conn.close()
+
+# Initialize database on startup
+init_db()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REMINDER SCHEDULER — runs every 30 seconds in background
+# ─────────────────────────────────────────────────────────────────────────────
+def reminder_scheduler():
+    """Background thread that checks and sends due reminders every 30 seconds"""
+    logger.info("[SCHEDULER] Started ✅")
+    while True:
+        try:
+            due = get_due_reminders()
+            for reminder_id, phone, task in due:
+                try:
+                    send_whatsapp_text(
+                        phone_number=phone,
+                        message=f"⏰ *Reminder:* {task}"
+                    )
+                    mark_sent(reminder_id)
+                    logger.info("[SCHEDULER] ✅ Sent reminder to %s: %s", phone, task)
+                except Exception as e:
+                    logger.error("[SCHEDULER] Failed to send reminder: %s", e)
+        except Exception as e:
+            logger.error("[SCHEDULER] Error: %s", e)
+        time.sleep(30)  # check every 30 seconds
+
+# Start scheduler in background thread
+scheduler_thread = threading.Thread(target=reminder_scheduler, daemon=True)
+scheduler_thread.start()
+logger.info("[SCHEDULER] Background thread started ✅")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PARSE REMINDER USING AI
+# ─────────────────────────────────────────────────────────────────────────────
+def parse_reminder_with_ai(message: str) -> dict | None:
+    """
+    Use Groq AI to understand reminder from natural language.
+    Returns dict with 'task' and 'remind_at' or None if not a reminder.
+    """
+    try:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        prompt = f"""Current date and time: {now}
+
+User message: "{message}"
+
+Is this a reminder request? Extract the details.
+
+Reply ONLY in this exact JSON format with no other text:
+If it IS a reminder:
+{{"is_reminder": true, "task": "the task description", "remind_at": "YYYY-MM-DD HH:MM"}}
+
+If it is NOT a reminder:
+{{"is_reminder": false}}
+
+Important: Use 24-hour time format. Calculate exact date for "tomorrow", "in 2 hours", "next Monday" etc based on current time."""
+
+        response = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=100,
+            temperature=0.1,
+        )
+
+        text = response.choices[0].message.content.strip()
+        # Clean any markdown formatting
+        text = text.replace("```json", "").replace("```", "").strip()
+        data = json.loads(text)
+        logger.info("[REMINDER_PARSER] Parsed: %s", data)
+        return data
+
+    except Exception as e:
+        logger.error("[REMINDER_PARSER] Error: %s", e)
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AI REPLY USING GROQ
 # ─────────────────────────────────────────────────────────────────────────────
 def generate_ai_reply(prompt: str, sender: str) -> str:
-    """
-    Send message to Groq LLaMA and return reply.
-    Remembers conversation history per user.
-    Groq is free, fast, and works in India without any billing.
-    """
+    """Generate AI reply, handling reminders specially"""
     logger.info("[AI] Message from %s: %s", sender, prompt[:120])
 
-    # Guards
     if not GROQ_API_KEY:
-        logger.error("[AI] GROQ_API_KEY missing in .env")
+        logger.error("[AI] GROQ_API_KEY missing")
         return "Sorry, AI is not configured."
 
     if groq_client is None:
-        logger.error("[AI] Groq SDK not installed. Run: pip install groq")
+        logger.error("[AI] Groq SDK not installed")
         return "Sorry, AI SDK is missing."
 
     try:
-        # Get or create conversation history for this sender
+        # ── Check if this is a reminder request ──────────────────────────────
+        reminder_keywords = ["remind", "reminder", "alert", "notify", "don't forget",
+                           "याद", "याद दिलाओ", "रिमाइंडर"]
+        is_likely_reminder = any(kw in prompt.lower() for kw in reminder_keywords)
+
+        if is_likely_reminder:
+            logger.info("[AI] Detected possible reminder request")
+            reminder_data = parse_reminder_with_ai(prompt)
+
+            if reminder_data and reminder_data.get("is_reminder"):
+                try:
+                    task = reminder_data.get("task", prompt)
+                    remind_at_str = reminder_data.get("remind_at")
+                    remind_at = datetime.strptime(remind_at_str, "%Y-%m-%d %H:%M")
+
+                    save_reminder(
+                        phone=sender,
+                        task=task,
+                        remind_at=remind_at
+                    )
+
+                    formatted = remind_at.strftime("%d %b %Y at %I:%M %p")
+                    logger.info("[AI] ✅ Reminder saved for %s", formatted)
+                    return f"✅ *Reminder set!*\n📋 Task: {task}\n⏰ Time: {formatted}\n\nI'll remind you then!"
+
+                except Exception as e:
+                    logger.error("[AI] Failed to save reminder: %s", e)
+                    return "Sorry, I couldn't set that reminder. Please try again with a clearer time like 'remind me tomorrow at 5pm to call John'."
+
+        # ── Normal AI reply ───────────────────────────────────────────────────
         if sender not in conversation_history:
             conversation_history[sender] = []
-            logger.info("[AI] New user — starting fresh conversation")
 
-        # Add user message to history
         conversation_history[sender].append({
             "role": "user",
             "content": prompt
         })
 
-        # Keep only last 10 messages to avoid token limits
         recent = conversation_history[sender][-10:]
 
-        # Call Groq
-        logger.info("[AI] Calling %s...", GROQ_MODEL)
         response = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
@@ -117,9 +258,8 @@ def generate_ai_reply(prompt: str, sender: str) -> str:
 - Keep replies short and clear (under 100 words)
 - Be conversational and warm
 - Reply in the same language the user writes in
-- If asked to set a reminder, confirm it clearly
-- Never make up false information
-- Be concise — this is WhatsApp, not email"""
+- You can set reminders when asked
+- Never make up false information"""
                 },
                 *recent
             ],
@@ -130,7 +270,6 @@ def generate_ai_reply(prompt: str, sender: str) -> str:
         reply = response.choices[0].message.content.strip()
         logger.info("[AI] ✅ Reply: %s", reply[:200])
 
-        # Save assistant reply to history
         conversation_history[sender].append({
             "role": "assistant",
             "content": reply
@@ -139,20 +278,8 @@ def generate_ai_reply(prompt: str, sender: str) -> str:
         return reply
 
     except Exception as e:
-        error_msg = str(e)
-        logger.exception("[AI] Error: %s", error_msg)
-
-        if "401" in error_msg or "invalid_api_key" in error_msg:
-            logger.error("[AI] Invalid Groq API key! Check GROQ_API_KEY in .env")
-            return "Sorry, AI configuration error."
-        elif "429" in error_msg:
-            logger.error("[AI] Groq rate limit hit — try again in a moment")
-            return "Sorry, AI is busy. Please try again in a moment."
-        elif "model_not_found" in error_msg:
-            logger.error("[AI] Groq model not found!")
-            return "Sorry, AI model error."
-        else:
-            return "Sorry, I encountered an error. Please try again."
+        logger.exception("[AI] Error: %s", e)
+        return "Sorry, I encountered an error. Please try again."
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -163,13 +290,8 @@ def send_whatsapp_text(
     message: str,
     phone_number_id: str | None = None,
 ) -> dict:
-    """
-    Send a WhatsApp message via Meta Cloud API.
-    Raises clear errors so we know exactly what went wrong.
-    """
     effective_phone_id = phone_number_id or PHONE_NUMBER_ID
 
-    # Guards
     if not WHATSAPP_TOKEN:
         raise ValueError("WHATSAPP_TOKEN missing in .env")
     if not effective_phone_id:
@@ -184,39 +306,29 @@ def send_whatsapp_text(
         "messaging_product": "whatsapp",
         "to": phone_number,
         "type": "text",
-        "text": {
-            "preview_url": False,
-            "body": message,
-        },
+        "text": {"preview_url": False, "body": message},
     }
 
     logger.info("[SEND] Sending to %s...", phone_number)
     resp = requests.post(url, headers=headers, json=payload, timeout=10)
     logger.info("[SEND] Status: %s", resp.status_code)
-    logger.info("[SEND] Response: %s", resp.text)
 
     if not resp.ok:
         raise RuntimeError(f"Meta API error {resp.status_code}: {resp.text}")
 
-    logger.info("[SEND] ✅ Message sent successfully!")
+    logger.info("[SEND] ✅ Message sent!")
     return resp.json()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WEBHOOK VERIFICATION (GET /webhook)
+# WEBHOOK VERIFICATION
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/webhook", response_class=PlainTextResponse)
 async def verify_webhook(request: Request):
-    """
-    Meta sends hub.mode, hub.verify_token, hub.challenge.
-    We return hub.challenge when token matches.
-    """
     params       = dict(request.query_params)
     mode         = params.get("hub.mode") or params.get("mode")
     verify_token = params.get("hub.verify_token") or params.get("verify_token")
     challenge    = params.get("hub.challenge") or params.get("challenge")
-
-    logger.info("[VERIFY] mode=%s token_match=%s", mode, verify_token == VERIFY_TOKEN)
 
     if verify_token == VERIFY_TOKEN and challenge:
         logger.info("[VERIFY] ✅ Webhook verified!")
@@ -227,73 +339,53 @@ async def verify_webhook(request: Request):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RECEIVE MESSAGES (POST /webhook)
+# RECEIVE MESSAGES
 # ─────────────────────────────────────────────────────────────────────────────
 @app.post("/webhook")
 async def receive_message(payload: Dict[str, Any]):
-    """
-    Receives incoming WhatsApp messages and sends AI reply back.
-    Always returns 200 so Meta does not retry.
-    """
-    logger.info("[WEBHOOK] Payload:\n%s", json.dumps(payload, indent=2))
+    logger.info("[WEBHOOK] Payload received")
 
     try:
         entries = payload.get("entry", [])
-
         if not entries:
-            logger.info("[WEBHOOK] No entries — test ping, ignoring")
             return {"status": "ignored"}
 
         for entry in entries:
             for change in entry.get("changes", []):
                 value = change.get("value", {})
 
-                # Skip delivery receipts and read receipts
                 if "statuses" in value and "messages" not in value:
                     logger.info("[WEBHOOK] Status update — skipping")
                     continue
 
                 messages = value.get("messages") or []
                 if not messages:
-                    logger.info("[WEBHOOK] No messages — skipping")
                     continue
 
-                # Get phone number ID from webhook metadata
                 metadata_phone_id = value.get("metadata", {}).get("phone_number_id")
                 phone_id_to_use   = metadata_phone_id or PHONE_NUMBER_ID
-                logger.info("[WEBHOOK] Phone ID: %s", phone_id_to_use)
 
                 for message in messages:
                     try:
                         sender   = message.get("from")
                         msg_type = message.get("type")
 
-                        logger.info("[MSG] from=%s type=%s", sender, msg_type)
-
                         if not sender:
-                            logger.warning("[MSG] No sender — skipping")
                             continue
 
-                        # Handle different message types
                         if msg_type == "text":
                             text_body = message.get("text", {}).get("body", "")
-                            logger.info("[MSG] Text: %s", text_body)
+                            logger.info("[MSG] from=%s text=%s", sender, text_body)
                             reply = generate_ai_reply(text_body, sender)
-
                         elif msg_type == "image":
-                            reply = "I received your image! I can only process text messages for now. 😊"
-
+                            reply = "I received your image! I can only process text for now. 😊"
                         elif msg_type == "audio":
-                            reply = "I received your voice message! I can only process text messages for now. 😊"
-
+                            reply = "I received your voice message! I can only process text for now. 😊"
                         elif msg_type == "document":
-                            reply = "I received your document! I can only process text messages for now. 😊"
-
+                            reply = "I received your document! I can only process text for now. 😊"
                         else:
-                            logger.info("[MSG] Unsupported type: %s — skipping", msg_type)
                             continue
 
-                        # Send reply back on WhatsApp
                         try:
                             send_whatsapp_text(
                                 phone_number=sender,
@@ -307,15 +399,14 @@ async def receive_message(payload: Dict[str, Any]):
                             if "401" in str(e):
                                 logger.error("[MSG] ❌ Token expired! Regenerate at developers.facebook.com")
                         except Exception as e:
-                            logger.exception("[MSG] Unexpected send error: %s", e)
+                            logger.exception("[MSG] Send error: %s", e)
 
                     except Exception as e:
-                        logger.exception("[MSG] Failed processing message: %s", e)
+                        logger.exception("[MSG] Processing error: %s", e)
 
     except Exception as e:
-        logger.exception("[WEBHOOK] Failed processing payload: %s", e)
+        logger.exception("[WEBHOOK] Error: %s", e)
 
-    # Always return 200
     return {"status": "received"}
 
 
@@ -324,19 +415,22 @@ async def receive_message(payload: Dict[str, Any]):
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    """
-    Visit http://localhost:8000/health to check everything is working.
-    All values should show SET or OK — nothing should show MISSING or ERROR.
-    """
+    # Count pending reminders
+    conn = sqlite3.connect(DB_FILE)
+    pending = conn.execute("SELECT COUNT(*) FROM reminders WHERE sent = 0").fetchone()[0]
+    total   = conn.execute("SELECT COUNT(*) FROM reminders").fetchone()[0]
+    conn.close()
+
     return {
-        "status"          : "ok ✅",
-        "groq_api_key"    : "SET ✅" if GROQ_API_KEY else "MISSING ❌",
-        "groq_model"      : GROQ_MODEL,
-        "whatsapp_token"  : "SET ✅" if WHATSAPP_TOKEN else "MISSING ❌",
-        "phone_number_id" : PHONE_NUMBER_ID or "MISSING ❌",
-        "verify_token"    : VERIFY_TOKEN,
-        "groq_sdk"        : "OK ✅" if groq_client else "ERROR ❌",
-        "users_in_memory" : len(conversation_history),
+        "status"           : "ok ✅",
+        "groq_api_key"     : "SET ✅" if GROQ_API_KEY else "MISSING ❌",
+        "whatsapp_token"   : "SET ✅" if WHATSAPP_TOKEN else "MISSING ❌",
+        "phone_number_id"  : PHONE_NUMBER_ID or "MISSING ❌",
+        "groq_sdk"         : "OK ✅" if groq_client else "ERROR ❌",
+        "scheduler"        : "RUNNING ✅",
+        "reminders_pending": pending,
+        "reminders_total"  : total,
+        "users_in_memory"  : len(conversation_history),
     }
 
 
