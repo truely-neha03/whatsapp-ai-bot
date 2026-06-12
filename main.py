@@ -758,6 +758,150 @@ async def health():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DASHBOARD
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/dashboard")
+async def dashboard():
+    from fastapi.responses import HTMLResponse
+
+    try:
+        now_ist = datetime.now(IST).strftime("%d %b %Y %I:%M:%S %p IST")
+
+        # Fetch all reminders
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id, phone, task, remind_at, recurrence, sent, created_at
+                    FROM reminders ORDER BY sent ASC, remind_at ASC
+                """)
+                all_reminders = cur.fetchall()
+
+        pending   = [r for r in all_reminders if not r[5]]
+        completed = [r for r in all_reminders if r[5]]
+
+        def reminder_rows(rows):
+            if not rows:
+                return "<tr><td colspan='6' style='text-align:center;color:#888'>No records</td></tr>"
+            html = ""
+            for r in rows:
+                rid, phone, task, remind_at, recurrence, sent, created_at = r
+                recurrence  = recurrence or "none"
+                badge_color = "#28a745" if recurrence != "none" else "#6c757d"
+                time_str    = remind_at.strftime("%d %b %Y %I:%M %p") if remind_at else "—"
+                html += f"""
+                <tr>
+                    <td>{rid}</td>
+                    <td>+{phone}</td>
+                    <td>{task}</td>
+                    <td>{time_str}</td>
+                    <td><span style="background:{badge_color};color:white;padding:2px 8px;border-radius:10px;font-size:12px">{recurrence}</span></td>
+                    <td><span style="background:{'#ffc107' if not sent else '#28a745'};color:white;padding:2px 8px;border-radius:10px;font-size:12px">{'pending' if not sent else 'done'}</span></td>
+                </tr>"""
+            return html
+
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>WhatsApp Bot Dashboard</title>
+    <meta http-equiv="refresh" content="30">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{ font-family: 'Segoe UI', sans-serif; background: #f0f2f5; color: #333; }}
+        .header {{ background: linear-gradient(135deg, #25D366, #128C7E); color: white; padding: 24px 32px; }}
+        .header h1 {{ font-size: 26px; }}
+        .header p {{ opacity: 0.85; margin-top: 4px; font-size: 14px; }}
+        .container {{ max-width: 1100px; margin: 24px auto; padding: 0 16px; }}
+        .cards {{ display: flex; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }}
+        .card {{ background: white; border-radius: 12px; padding: 20px 24px; flex: 1; min-width: 180px;
+                 box-shadow: 0 2px 8px rgba(0,0,0,0.07); text-align: center; }}
+        .card .num {{ font-size: 36px; font-weight: bold; color: #128C7E; }}
+        .card .label {{ color: #666; margin-top: 4px; font-size: 14px; }}
+        .status-bar {{ background: white; border-radius: 12px; padding: 16px 24px; margin-bottom: 24px;
+                       box-shadow: 0 2px 8px rgba(0,0,0,0.07); display: flex; gap: 24px; flex-wrap: wrap; }}
+        .status-item {{ font-size: 14px; }}
+        .status-item span {{ font-weight: 600; }}
+        .section {{ background: white; border-radius: 12px; padding: 20px 24px; margin-bottom: 24px;
+                    box-shadow: 0 2px 8px rgba(0,0,0,0.07); }}
+        .section h2 {{ font-size: 18px; margin-bottom: 16px; color: #128C7E; }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
+        th {{ background: #f8f9fa; padding: 10px 12px; text-align: left; font-weight: 600; color: #555;
+              border-bottom: 2px solid #dee2e6; }}
+        td {{ padding: 10px 12px; border-bottom: 1px solid #f0f0f0; }}
+        tr:hover td {{ background: #f8fffe; }}
+        .refresh {{ color: #888; font-size: 12px; text-align: center; margin-top: 16px; }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🤖 WhatsApp Bot Dashboard</h1>
+        <p>Live status — auto refreshes every 30 seconds &nbsp;|&nbsp; {now_ist}</p>
+    </div>
+    <div class="container">
+
+        <!-- Stats Cards -->
+        <div class="cards">
+            <div class="card">
+                <div class="num">{len(pending)}</div>
+                <div class="label">⏳ Pending Reminders</div>
+            </div>
+            <div class="card">
+                <div class="num">{len(completed)}</div>
+                <div class="label">✅ Completed</div>
+            </div>
+            <div class="card">
+                <div class="num">{len([r for r in pending if r[4] and r[4] != 'none'])}</div>
+                <div class="label">🔁 Recurring Active</div>
+            </div>
+            <div class="card">
+                <div class="num">{len(conversation_history)}</div>
+                <div class="label">💬 Active Users</div>
+            </div>
+        </div>
+
+        <!-- System Status -->
+        <div class="status-bar">
+            <div class="status-item">🤖 Bot: <span style="color:#28a745">RUNNING</span></div>
+            <div class="status-item">🧠 AI: <span style="color:#28a745">{'ON' if groq_client else 'OFF'}</span></div>
+            <div class="status-item">🗄️ DB: <span style="color:#28a745">PostgreSQL</span></div>
+            <div class="status-item">🎙️ Voice: <span style="color:{'#28a745' if GTTS_AVAILABLE else '#dc3545'}">{'ON' if GTTS_AVAILABLE else 'OFF'}</span></div>
+            <div class="status-item">📞 Calls: <span style="color:{'#28a745' if TWILIO_AVAILABLE and TWILIO_ACCOUNT_SID else '#dc3545'}">{'ON' if TWILIO_AVAILABLE and TWILIO_ACCOUNT_SID else 'OFF'}</span></div>
+        </div>
+
+        <!-- Pending Reminders -->
+        <div class="section">
+            <h2>⏳ Pending Reminders ({len(pending)})</h2>
+            <table>
+                <tr>
+                    <th>ID</th><th>Phone</th><th>Task</th><th>Scheduled Time</th><th>Recurrence</th><th>Status</th>
+                </tr>
+                {reminder_rows(pending)}
+            </table>
+        </div>
+
+        <!-- Completed Reminders -->
+        <div class="section">
+            <h2>✅ Completed Reminders ({len(completed)})</h2>
+            <table>
+                <tr>
+                    <th>ID</th><th>Phone</th><th>Task</th><th>Was Scheduled</th><th>Recurrence</th><th>Status</th>
+                </tr>
+                {reminder_rows(completed)}
+            </table>
+        </div>
+
+        <div class="refresh">🔄 Page auto-refreshes every 30 seconds</div>
+    </div>
+</body>
+</html>"""
+        return HTMLResponse(content=html)
+
+    except Exception as exc:
+        logger.exception("[DASHBOARD] Error: %s", exc)
+        return HTMLResponse(content=f"<h2>Dashboard error: {exc}</h2>", status_code=500)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
