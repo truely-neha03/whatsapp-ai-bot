@@ -37,9 +37,12 @@ GROQ_API_KEY      = os.getenv("GROQ_API_KEY", "")
 WHATSAPP_TOKEN    = os.getenv("WHATSAPP_TOKEN", "")
 PHONE_NUMBER_ID   = os.getenv("PHONE_NUMBER_ID", "")
 VERIFY_TOKEN      = os.getenv("VERIFY_TOKEN", "my_secret_token_123")
-DATABASE_URL      = os.getenv("DATABASE_URL", "")        # ← auto-set by Railway PostgreSQL
-GROQ_MODEL        = "llama-3.3-70b-versatile"
-GRAPH_API_VERSION = "v22.0"
+DATABASE_URL          = os.getenv("DATABASE_URL", "")
+TWILIO_ACCOUNT_SID    = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN     = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_PHONE_NUMBER   = os.getenv("TWILIO_PHONE_NUMBER", "")
+GROQ_MODEL            = "llama-3.3-70b-versatile"
+GRAPH_API_VERSION     = "v22.0"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -76,6 +79,15 @@ try:
 except ImportError:
     GTTS_AVAILABLE = False
     logger.warning("gTTS NOT installed — voice notes disabled. Run: pip install gtts")
+
+# ── Twilio ────────────────────────────────────────────────────────────────────
+try:
+    from twilio.rest import Client as TwilioClient
+    TWILIO_AVAILABLE = True
+    logger.info("Twilio   : OK ✅")
+except ImportError:
+    TWILIO_AVAILABLE = False
+    logger.warning("Twilio NOT installed — calls disabled. Run: pip install twilio")
 
 # ── Conversation Memory ───────────────────────────────────────────────────────
 conversation_history: Dict[str, list] = {}
@@ -303,19 +315,64 @@ def send_whatsapp_audio(phone_number: str, audio_path: str, phone_number_id: str
     return send_resp.json()
 
 
+def make_twilio_call(phone: str, task: str):
+    """
+    Make an automated voice call using Twilio.
+    Phone number must include country code e.g. +919876543210
+    """
+    if not TWILIO_AVAILABLE:
+        logger.warning("[CALL] Twilio not installed — skipping call")
+        return
+
+    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_PHONE_NUMBER:
+        logger.warning("[CALL] Twilio credentials missing — skipping call")
+        return
+
+    try:
+        # Format phone — WhatsApp numbers come as 919876543210, need +919876543210
+        to_number = phone if phone.startswith("+") else f"+{phone}"
+
+        client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+        # TwiML — what Twilio says when call is picked up
+        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="alice" language="en-IN">
+        Hello! This is your WhatsApp bot reminder.
+        {task}.
+        I repeat, {task}.
+        Have a great day!
+    </Say>
+    <Pause length="1"/>
+</Response>"""
+
+        call = client.calls.create(
+            twiml=twiml,
+            to=to_number,
+            from_=TWILIO_PHONE_NUMBER,
+        )
+        logger.info("[CALL] ✅ Call initiated to %s — SID: %s", to_number, call.sid)
+
+    except Exception as exc:
+        logger.error("[CALL] ❌ Call failed: %s", exc)
+
+
 def send_reminder_with_voice(phone: str, task: str):
     """
-    Send reminder as BOTH a text message AND a voice note.
-    If voice note fails, text message still goes through.
+    Send reminder as text + WhatsApp voice note + phone call.
+    Each step is independent — if one fails, others still go through.
     """
     # 1. Always send text first
-    send_whatsapp_text(
-        phone_number=phone,
-        message=f"⏰ *Reminder:* {task}",
-    )
-    logger.info("[REMINDER] ✅ Text sent to %s", phone)
+    try:
+        send_whatsapp_text(
+            phone_number=phone,
+            message=f"⏰ *Reminder:* {task}",
+        )
+        logger.info("[REMINDER] ✅ Text sent to %s", phone)
+    except Exception as exc:
+        logger.error("[REMINDER] ❌ Text failed: %s", exc)
 
-    # 2. Try to send voice note
+    # 2. Send WhatsApp voice note
     voice_text = f"Hey! This is your reminder. {task}"
     audio_path = generate_voice_note(voice_text)
     if audio_path:
@@ -323,7 +380,13 @@ def send_reminder_with_voice(phone: str, task: str):
             send_whatsapp_audio(phone_number=phone, audio_path=audio_path)
             logger.info("[REMINDER] ✅ Voice note sent to %s", phone)
         except Exception as exc:
-            logger.error("[REMINDER] ❌ Voice note failed (text was sent): %s", exc)
+            logger.error("[REMINDER] ❌ Voice note failed: %s", exc)
+
+    # 3. Make phone call via Twilio
+    try:
+        make_twilio_call(phone=phone, task=task)
+    except Exception as exc:
+        logger.error("[REMINDER] ❌ Call failed: %s", exc)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -620,6 +683,7 @@ async def health():
         "phone_number_id"   : PHONE_NUMBER_ID or "MISSING ❌",
         "groq_sdk"          : "OK ✅" if groq_client else "ERROR ❌",
         "gtts"              : "OK ✅" if GTTS_AVAILABLE else "NOT INSTALLED ⚠️",
+        "twilio"            : "OK ✅" if (TWILIO_AVAILABLE and TWILIO_ACCOUNT_SID) else "NOT CONFIGURED ⚠️",
         "scheduler"         : "RUNNING ✅",
         "reminders_pending" : pending,
         "reminders_total"   : total,
