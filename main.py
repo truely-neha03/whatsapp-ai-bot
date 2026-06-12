@@ -112,15 +112,21 @@ def init_db():
                     phone      TEXT NOT NULL,
                     task       TEXT NOT NULL,
                     remind_at  TIMESTAMP NOT NULL,
+                    recurrence TEXT DEFAULT 'none',
                     sent       BOOLEAN DEFAULT FALSE,
                     created_at TIMESTAMP DEFAULT NOW()
                 )
+            """)
+            # Add recurrence column if upgrading from old schema
+            cur.execute("""
+                ALTER TABLE reminders
+                ADD COLUMN IF NOT EXISTS recurrence TEXT DEFAULT 'none'
             """)
         conn.commit()
     logger.info("Database initialised ✅ (PostgreSQL)")
 
 
-def save_reminder(phone: str, task: str, remind_at: datetime):
+def save_reminder(phone: str, task: str, remind_at: datetime, recurrence: str = "none"):
     """Store reminder. remind_at may be naive (assumed IST) or aware."""
     if remind_at.tzinfo is None:
         remind_at = remind_at.replace(tzinfo=IST)
@@ -130,11 +136,11 @@ def save_reminder(phone: str, task: str, remind_at: datetime):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO reminders (phone, task, remind_at) VALUES (%s, %s, %s)",
-                (phone, task, remind_at),
+                "INSERT INTO reminders (phone, task, remind_at, recurrence) VALUES (%s, %s, %s, %s)",
+                (phone, task, remind_at, recurrence),
             )
         conn.commit()
-    logger.info("[DB] Saved reminder: '%s' at %s for %s", task, remind_at, phone)
+    logger.info("[DB] Saved reminder: '%s' at %s recurrence=%s for %s", task, remind_at, recurrence, phone)
 
 
 def get_due_reminders():
@@ -143,7 +149,7 @@ def get_due_reminders():
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, phone, task, remind_at FROM reminders "
+                "SELECT id, phone, task, remind_at, recurrence FROM reminders "
                 "WHERE remind_at <= %s AND sent = FALSE ORDER BY remind_at",
                 (now,),
             )
@@ -156,6 +162,41 @@ def mark_sent(reminder_id: int):
         with conn.cursor() as cur:
             cur.execute("UPDATE reminders SET sent = TRUE WHERE id = %s", (reminder_id,))
         conn.commit()
+
+
+def reschedule_reminder(reminder_id: int, current_time: datetime, recurrence: str):
+    """
+    For recurring reminders — calculate next fire time and reset sent=FALSE.
+    recurrence: hourly | daily | weekly | monthly
+    """
+    from datetime import timedelta
+
+    if recurrence == "hourly":
+        next_time = current_time + timedelta(hours=1)
+    elif recurrence == "daily":
+        next_time = current_time + timedelta(days=1)
+    elif recurrence == "weekly":
+        next_time = current_time + timedelta(weeks=1)
+    elif recurrence == "monthly":
+        # Same day next month
+        month = current_time.month + 1 if current_time.month < 12 else 1
+        year  = current_time.year + 1 if current_time.month == 12 else current_time.year
+        try:
+            next_time = current_time.replace(year=year, month=month)
+        except ValueError:
+            # Handle months with fewer days (e.g. Feb 30)
+            next_time = current_time.replace(year=year, month=month, day=28)
+    else:
+        return  # not recurring
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE reminders SET remind_at = %s, sent = FALSE WHERE id = %s",
+                (next_time, reminder_id),
+            )
+        conn.commit()
+    logger.info("[DB] Rescheduled #%d → next: %s (%s)", reminder_id, next_time, recurrence)
 
 
 def get_reminder_counts():
@@ -400,12 +441,20 @@ def reminder_scheduler():
             if due:
                 logger.info("[SCHEDULER] %d due reminder(s) found", len(due))
 
-            for reminder_id, phone, task, remind_at in due:
-                logger.info("[SCHEDULER] Firing reminder #%d → %s : %s", reminder_id, phone, task)
+            for reminder_id, phone, task, remind_at, recurrence in due:
+                logger.info("[SCHEDULER] Firing reminder #%d → %s : %s (recurrence=%s)", reminder_id, phone, task, recurrence)
                 try:
                     send_reminder_with_voice(phone=phone, task=task)
-                    mark_sent(reminder_id)
-                    logger.info("[SCHEDULER] ✅ Sent & marked done: #%d", reminder_id)
+
+                    if recurrence and recurrence != "none":
+                        # Recurring — reschedule for next occurrence
+                        reschedule_reminder(reminder_id, remind_at, recurrence)
+                        logger.info("[SCHEDULER] ✅ Rescheduled recurring #%d (%s)", reminder_id, recurrence)
+                    else:
+                        # One-time — mark done
+                        mark_sent(reminder_id)
+                        logger.info("[SCHEDULER] ✅ Sent & marked done: #%d", reminder_id)
+
                 except Exception as exc:
                     logger.error("[SCHEDULER] ❌ Failed reminder #%d: %s", reminder_id, exc)
 
@@ -456,16 +505,20 @@ User message: "{message}"
 
 Is this a reminder request? Reply ONLY with valid JSON — no markdown, no extra text.
 
-If YES:
-{{"is_reminder": true, "task": "clean description of what to remind", "remind_at": "YYYY-MM-DD HH:MM"}}
+If YES (one-time):
+{{"is_reminder": true, "task": "clean description", "remind_at": "YYYY-MM-DD HH:MM", "recurrence": "none"}}
+
+If YES (recurring):
+{{"is_reminder": true, "task": "clean description", "remind_at": "YYYY-MM-DD HH:MM", "recurrence": "hourly|daily|weekly|monthly"}}
 
 If NO:
 {{"is_reminder": false}}
 
 Rules:
-- remind_at must be 24-hour format
-- Calculate exact datetime for "tomorrow", "in 2 hours", "next Monday", "at 5pm" etc from the current IST time
-- remind_at must be in the future"""
+- remind_at must be 24-hour format and in the future
+- recurrence = "daily" for "every day", "weekly" for "every week/Monday", "monthly" for "every month", "hourly" for "every hour"
+- recurrence = "none" for one-time reminders
+- Calculate exact first occurrence from current IST time"""
 
         resp = groq_client.chat.completions.create(
             model=GROQ_MODEL,
@@ -511,6 +564,7 @@ def generate_ai_reply(prompt: str, sender: str) -> str:
             if data and data.get("is_reminder"):
                 task        = data.get("task", prompt)
                 time_str    = data.get("remind_at", "")
+                recurrence  = data.get("recurrence", "none")
                 try:
                     naive_dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
                     aware_dt = naive_dt.replace(tzinfo=IST)
@@ -521,8 +575,17 @@ def generate_ai_reply(prompt: str, sender: str) -> str:
                             "Please give me a future time, e.g. _'remind me in 2 hours to call John'_"
                         )
 
-                    save_reminder(phone=sender, task=task, remind_at=aware_dt)
+                    save_reminder(phone=sender, task=task, remind_at=aware_dt, recurrence=recurrence)
                     formatted = aware_dt.strftime("%d %b %Y at %I:%M %p IST")
+
+                    if recurrence and recurrence != "none":
+                        return (
+                            f"✅ *Recurring Reminder set!*\n"
+                            f"📋 Task: {task}\n"
+                            f"⏰ First reminder: {formatted}\n"
+                            f"🔁 Repeats: {recurrence.capitalize()}\n\n"
+                            f"I'll keep reminding you!"
+                        )
                     return (
                         f"✅ *Reminder set!*\n"
                         f"📋 Task: {task}\n"
