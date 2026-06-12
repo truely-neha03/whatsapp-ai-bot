@@ -563,8 +563,116 @@ Rules:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AI REPLY
+# WHISPER — transcribe voice messages using Groq's free Whisper API
 # ─────────────────────────────────────────────────────────────────────────────
+def download_whatsapp_audio(media_id: str) -> str | None:
+    """
+    Download audio file from WhatsApp media API.
+    Returns temp file path or None on failure.
+    """
+    try:
+        # Step 1 — get download URL from media ID
+        url  = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{media_id}"
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+            timeout=15,
+        )
+        if not resp.ok:
+            logger.error("[WHISPER] Failed to get media URL: %s", resp.text)
+            return None
+
+        download_url = resp.json().get("url")
+        if not download_url:
+            logger.error("[WHISPER] No URL in media response")
+            return None
+
+        # Step 2 — download the audio file
+        audio_resp = requests.get(
+            download_url,
+            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+            timeout=30,
+        )
+        if not audio_resp.ok:
+            logger.error("[WHISPER] Failed to download audio: %s", audio_resp.status_code)
+            return None
+
+        # Save to temp file as .ogg (WhatsApp audio format)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".ogg")
+        tmp.write(audio_resp.content)
+        tmp.close()
+        logger.info("[WHISPER] ✅ Audio downloaded: %s (%d bytes)", tmp.name, len(audio_resp.content))
+        return tmp.name
+
+    except Exception as exc:
+        logger.error("[WHISPER] Download error: %s", exc)
+        return None
+
+
+def transcribe_audio(audio_path: str) -> str | None:
+    """
+    Transcribe audio file using Groq's free Whisper API.
+    Returns transcribed text or None on failure.
+    """
+    try:
+        with open(audio_path, "rb") as f:
+            transcription = groq_client.audio.transcriptions.create(
+                file=(os.path.basename(audio_path), f),
+                model="whisper-large-v3",
+                response_format="text",
+                language="en",
+            )
+        # Clean up temp file
+        try:
+            os.remove(audio_path)
+        except Exception:
+            pass
+
+        text = transcription.strip() if isinstance(transcription, str) else str(transcription).strip()
+        logger.info("[WHISPER] ✅ Transcribed: %s", text[:200])
+        return text
+
+    except Exception as exc:
+        logger.error("[WHISPER] Transcription error: %s", exc)
+        return None
+
+
+def handle_voice_message(msg: dict, sender: str) -> str:
+    """
+    Full pipeline: download → transcribe → AI reply.
+    """
+    try:
+        # Get media ID from message
+        audio_data = msg.get("audio") or msg.get("voice") or {}
+        media_id   = audio_data.get("id")
+
+        if not media_id:
+            return "I received your voice message but couldn't process it. Please try again! 😊"
+
+        logger.info("[WHISPER] Processing voice message from %s media_id=%s", sender, media_id)
+
+        # Download audio
+        audio_path = download_whatsapp_audio(media_id)
+        if not audio_path:
+            return "Sorry, I couldn't download your voice message. Please try again! 🎤"
+
+        # Transcribe
+        text = transcribe_audio(audio_path)
+        if not text:
+            return "Sorry, I couldn't understand your voice message. Please speak clearly or type instead! 🎤"
+
+        logger.info("[WHISPER] ✅ Voice message from %s: %s", sender, text[:100])
+
+        # Reply with transcription + AI response
+        ai_reply = generate_ai_reply(text, sender)
+        return f"🎤 _I heard: \"{text}\"_\n\n{ai_reply}"
+
+    except Exception as exc:
+        logger.error("[WHISPER] handle_voice_message error: %s", exc)
+        return "Sorry, I had trouble processing your voice message. Please try again! 🎤"
+
+
+
 REMINDER_KEYWORDS = [
     "remind", "reminder", "alert", "notify", "don't forget",
     "याद", "याद दिलाओ", "रिमाइंडर", "set a reminder", "set reminder",
@@ -762,12 +870,13 @@ async def receive_message(payload: Dict[str, Any]):
                         body  = msg.get("text", {}).get("body", "")
                         logger.info("[MSG] from=%s  body=%s", sender, body)
                         reply = generate_ai_reply(body, sender)
-                    elif msg_type == "image":
-                        reply = "I received your image! I can only process text for now. 😊"
                     elif msg_type == "audio":
-                        reply = "I received your voice message! I can only process text for now. 😊"
+                        logger.info("[MSG] Voice message from %s — transcribing...", sender)
+                        reply = handle_voice_message(msg, sender)
+                    elif msg_type == "image":
+                        reply = "I received your image! I can only process text and voice for now. 😊"
                     elif msg_type == "document":
-                        reply = "I received your document! I can only process text for now. 😊"
+                        reply = "I received your document! I can only process text and voice for now. 😊"
                     else:
                         logger.info("[MSG] Unsupported type '%s' — skipping", msg_type)
                         continue
