@@ -199,7 +199,29 @@ def reschedule_reminder(reminder_id: int, current_time: datetime, recurrence: st
     logger.info("[DB] Rescheduled #%d → next: %s (%s)", reminder_id, next_time, recurrence)
 
 
-def get_reminder_counts():
+def get_pending_reminders_for_user(phone: str):
+    """Get all pending reminders for a specific user."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, task, remind_at, recurrence FROM reminders "
+                "WHERE phone = %s AND sent = FALSE ORDER BY remind_at",
+                (phone,),
+            )
+            return cur.fetchall()
+
+
+def cancel_reminder_for_user(phone: str, reminder_id: int) -> bool:
+    """Cancel a specific reminder for a user. Returns True if deleted."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM reminders WHERE id = %s AND phone = %s AND sent = FALSE",
+                (reminder_id, phone),
+            )
+            deleted = cur.rowcount > 0
+        conn.commit()
+    return deleted
     """Return (pending, total) counts for health check."""
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -548,6 +570,53 @@ REMINDER_KEYWORDS = [
     "याद", "याद दिलाओ", "रिमाइंडर", "set a reminder", "set reminder",
 ]
 
+LIST_KEYWORDS   = ["my reminders", "show reminders", "list reminders",
+                   "my reminder", "reminders list", "what are my reminders",
+                   "मेरे रिमाइंडर"]
+
+CANCEL_KEYWORDS = ["cancel reminder", "delete reminder", "remove reminder",
+                   "cancel reminders", "रिमाइंडर कैंसिल"]
+
+
+def handle_list_reminders(sender: str) -> str:
+    rows = get_pending_reminders_for_user(sender)
+    if not rows:
+        return "📭 You have no pending reminders!\n\nSend me something like:\n_'Remind me tomorrow at 5pm to call John'_"
+
+    lines = ["📋 *Your Pending Reminders:*\n"]
+    for rid, task, remind_at, recurrence in rows:
+        time_str   = remind_at.strftime("%d %b %Y at %I:%M %p IST") if remind_at else "—"
+        recur_str  = f" 🔁 {recurrence}" if recurrence and recurrence != "none" else ""
+        lines.append(f"*#{rid}* — {task}\n⏰ {time_str}{recur_str}")
+
+    lines.append("\n_To cancel: type 'cancel reminder 2' (use the # number)_")
+    return "\n\n".join(lines)
+
+
+def handle_cancel_reminder(sender: str, prompt: str) -> str:
+    import re
+    # Extract number from message e.g. "cancel reminder 3" → 3
+    match = re.search(r'\d+', prompt)
+    if not match:
+        return (
+            "Please tell me which reminder to cancel.\n"
+            "Example: _'cancel reminder 2'_\n\n"
+            "Type *my reminders* to see the list with IDs."
+        )
+
+    reminder_id = int(match.group())
+    deleted     = cancel_reminder_for_user(sender, reminder_id)
+
+    if deleted:
+        logger.info("[CANCEL] ✅ Reminder #%d cancelled for %s", reminder_id, sender)
+        return f"✅ Reminder *#{reminder_id}* has been cancelled!\n\nType *my reminders* to see remaining reminders."
+    else:
+        return (
+            f"❌ Couldn't find reminder *#{reminder_id}*.\n"
+            "It may not exist or already completed.\n\n"
+            "Type *my reminders* to see your active reminders."
+        )
+
 
 def generate_ai_reply(prompt: str, sender: str) -> str:
     logger.info("[AI] from=%s  msg=%s", sender, prompt[:120])
@@ -556,8 +625,20 @@ def generate_ai_reply(prompt: str, sender: str) -> str:
         return "Sorry, AI is not configured correctly."
 
     try:
+        p_lower = prompt.lower()
+
+        # ── List reminders ────────────────────────────────────────────────────
+        if any(kw in p_lower for kw in LIST_KEYWORDS):
+            logger.info("[AI] List reminders request from %s", sender)
+            return handle_list_reminders(sender)
+
+        # ── Cancel reminder ───────────────────────────────────────────────────
+        if any(kw in p_lower for kw in CANCEL_KEYWORDS):
+            logger.info("[AI] Cancel reminder request from %s", sender)
+            return handle_cancel_reminder(sender, prompt)
+
         # ── Reminder path ─────────────────────────────────────────────────────
-        if any(kw in prompt.lower() for kw in REMINDER_KEYWORDS):
+        if any(kw in p_lower for kw in REMINDER_KEYWORDS):
             logger.info("[AI] Possible reminder request detected")
             data = parse_reminder_with_ai(prompt)
 
