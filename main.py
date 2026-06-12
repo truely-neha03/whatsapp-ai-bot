@@ -11,7 +11,6 @@ VERIFY_TOKEN=my_secret_token_123
 import os
 import json
 import logging
-import sqlite3
 import threading
 import time
 import tempfile
@@ -29,15 +28,18 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
 import requests
 
-# gTTS import — checked after logger is ready (see below)
+# ── PostgreSQL ────────────────────────────────────────────────────────────────
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 # ── Config ────────────────────────────────────────────────────────────────────
 GROQ_API_KEY      = os.getenv("GROQ_API_KEY", "")
 WHATSAPP_TOKEN    = os.getenv("WHATSAPP_TOKEN", "")
 PHONE_NUMBER_ID   = os.getenv("PHONE_NUMBER_ID", "")
 VERIFY_TOKEN      = os.getenv("VERIFY_TOKEN", "my_secret_token_123")
+DATABASE_URL      = os.getenv("DATABASE_URL", "")        # ← auto-set by Railway PostgreSQL
 GROQ_MODEL        = "llama-3.3-70b-versatile"
-GRAPH_API_VERSION = "v22.0"          # ← stable version, v25 can 404
+GRAPH_API_VERSION = "v22.0"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -82,26 +84,28 @@ app = FastAPI(title="WhatsApp AI Bot with Reminders")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DATABASE
+# DATABASE — PostgreSQL (persistent, survives Railway restarts)
 # ─────────────────────────────────────────────────────────────────────────────
-DB_FILE = "reminders.db"
+def get_conn():
+    """Get a fresh PostgreSQL connection."""
+    return psycopg2.connect(DATABASE_URL)
 
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS reminders (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            phone      TEXT NOT NULL,
-            task       TEXT NOT NULL,
-            remind_at  TEXT NOT NULL,
-            sent       INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
-    logger.info("Database initialised ✅")
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS reminders (
+                    id         SERIAL PRIMARY KEY,
+                    phone      TEXT NOT NULL,
+                    task       TEXT NOT NULL,
+                    remind_at  TIMESTAMP NOT NULL,
+                    sent       BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+        conn.commit()
+    logger.info("Database initialised ✅ (PostgreSQL)")
 
 
 def save_reminder(phone: str, task: str, remind_at: datetime):
@@ -111,35 +115,59 @@ def save_reminder(phone: str, task: str, remind_at: datetime):
     else:
         remind_at = remind_at.astimezone(IST)
 
-    remind_at_str = remind_at.strftime("%Y-%m-%d %H:%M:%S")
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute(
-        "INSERT INTO reminders (phone, task, remind_at) VALUES (?, ?, ?)",
-        (phone, task, remind_at_str),
-    )
-    conn.commit()
-    conn.close()
-    logger.info("[DB] Saved reminder: '%s' at %s for %s", task, remind_at_str, phone)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO reminders (phone, task, remind_at) VALUES (%s, %s, %s)",
+                (phone, task, remind_at),
+            )
+        conn.commit()
+    logger.info("[DB] Saved reminder: '%s' at %s for %s", task, remind_at, phone)
 
 
 def get_due_reminders():
     """Return reminders whose remind_at <= now (IST), not yet sent."""
-    now_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-    conn    = sqlite3.connect(DB_FILE)
-    rows    = conn.execute(
-        "SELECT id, phone, task, remind_at FROM reminders "
-        "WHERE remind_at <= ? AND sent = 0 ORDER BY remind_at",
-        (now_str,),
-    ).fetchall()
-    conn.close()
+    now = datetime.now(IST)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, phone, task, remind_at FROM reminders "
+                "WHERE remind_at <= %s AND sent = FALSE ORDER BY remind_at",
+                (now,),
+            )
+            rows = cur.fetchall()
     return rows
 
 
 def mark_sent(reminder_id: int):
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (reminder_id,))
-    conn.commit()
-    conn.close()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE reminders SET sent = TRUE WHERE id = %s", (reminder_id,))
+        conn.commit()
+
+
+def get_reminder_counts():
+    """Return (pending, total) counts for health check."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM reminders WHERE sent = FALSE")
+            pending = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM reminders")
+            total = cur.fetchone()[0]
+    return pending, total
+
+
+def get_upcoming_reminders(limit: int = 5):
+    """Return next N pending reminders for health check."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT phone, task, remind_at FROM reminders "
+                "WHERE sent = FALSE ORDER BY remind_at LIMIT %s",
+                (limit,),
+            )
+            rows = cur.fetchall()
+    return rows
 
 
 init_db()
@@ -574,27 +602,29 @@ async def test_send(to: str):
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    conn    = sqlite3.connect(DB_FILE)
-    pending = conn.execute("SELECT COUNT(*) FROM reminders WHERE sent=0").fetchone()[0]
-    total   = conn.execute("SELECT COUNT(*) FROM reminders").fetchone()[0]
-    upcoming = conn.execute(
-        "SELECT phone, task, remind_at FROM reminders WHERE sent=0 ORDER BY remind_at LIMIT 5"
-    ).fetchall()
-    conn.close()
+    try:
+        pending, total = get_reminder_counts()
+        upcoming       = get_upcoming_reminders()
+        db_status      = "OK ✅"
+    except Exception as exc:
+        pending, total, upcoming = 0, 0, []
+        db_status = f"ERROR ❌ {exc}"
 
     return {
         "status"            : "ok ✅",
         "current_time_ist"  : datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+        "database"          : db_status,
         "groq_api_key"      : "SET ✅" if GROQ_API_KEY else "MISSING ❌",
         "whatsapp_token"    : "SET ✅" if WHATSAPP_TOKEN else "MISSING ❌",
         "whatsapp_token_prefix": WHATSAPP_TOKEN[:12] + "..." if WHATSAPP_TOKEN else "MISSING",
         "phone_number_id"   : PHONE_NUMBER_ID or "MISSING ❌",
         "groq_sdk"          : "OK ✅" if groq_client else "ERROR ❌",
+        "gtts"              : "OK ✅" if GTTS_AVAILABLE else "NOT INSTALLED ⚠️",
         "scheduler"         : "RUNNING ✅",
         "reminders_pending" : pending,
         "reminders_total"   : total,
         "upcoming_reminders": [
-            {"phone": r[0], "task": r[1], "remind_at": r[2]} for r in upcoming
+            {"phone": r[0], "task": r[1], "remind_at": str(r[2])} for r in upcoming
         ],
         "users_in_memory"   : len(conversation_history),
     }
