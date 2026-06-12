@@ -5,3 +5,4 @@ requests
 groq
 gtts
 psycopg2-binary
+twilio
