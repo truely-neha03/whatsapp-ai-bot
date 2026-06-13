@@ -117,10 +117,19 @@ def init_db():
                     created_at TIMESTAMP DEFAULT NOW()
                 )
             """)
-            # Add recurrence column if upgrading from old schema
             cur.execute("""
                 ALTER TABLE reminders
                 ADD COLUMN IF NOT EXISTS recurrence TEXT DEFAULT 'none'
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS contacts (
+                    id         SERIAL PRIMARY KEY,
+                    owner      TEXT NOT NULL,
+                    phone      TEXT NOT NULL,
+                    name       TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE(owner, phone)
+                )
             """)
         conn.commit()
     logger.info("Database initialised ✅ (PostgreSQL)")
@@ -199,8 +208,49 @@ def reschedule_reminder(reminder_id: int, current_time: datetime, recurrence: st
     logger.info("[DB] Rescheduled #%d → next: %s (%s)", reminder_id, next_time, recurrence)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CONTACTS DB FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+def add_contact(owner: str, phone: str, name: str) -> bool:
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO contacts (owner, phone, name) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (owner, phone) DO UPDATE SET name = %s",
+                    (owner, phone, name, name),
+                )
+            conn.commit()
+        logger.info("[CONTACTS] Saved %s (%s) for %s", name, phone, owner)
+        return True
+    except Exception as exc:
+        logger.error("[CONTACTS] Add error: %s", exc)
+        return False
+
+
+def get_contacts(owner: str) -> list:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT phone, name FROM contacts WHERE owner = %s ORDER BY name",
+                (owner,),
+            )
+            return cur.fetchall()
+
+
+def remove_contact(owner: str, phone: str) -> bool:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM contacts WHERE owner = %s AND phone = %s",
+                (owner, phone),
+            )
+            deleted = cur.rowcount > 0
+        conn.commit()
+    return deleted
+
+
 def get_pending_reminders_for_user(phone: str):
-    """Get all pending reminders for a specific user."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -684,6 +734,110 @@ LIST_KEYWORDS   = ["my reminders", "show reminders", "list reminders",
 
 CANCEL_KEYWORDS = ["cancel reminder", "delete reminder", "remove reminder",
                    "cancel reminders", "रिमाइंडर कैंसिल"]
+
+BROADCAST_KEYWORDS  = ["broadcast:", "broadcast :", "send to all", "announce:"]
+ADD_CONTACT_KEYWORDS    = ["add contact", "save contact", "new contact"]
+LIST_CONTACT_KEYWORDS   = ["my contacts", "show contacts", "list contacts", "contact list"]
+REMOVE_CONTACT_KEYWORDS = ["remove contact", "delete contact"]
+
+
+def handle_add_contact(sender: str, prompt: str) -> str:
+    """Parse 'add contact 919876543210 John' and save."""
+    import re
+    # Extract phone number (10+ digits)
+    phone_match = re.search(r'\d{10,15}', prompt)
+    if not phone_match:
+        return (
+            "Please include the phone number with country code.\n"
+            "Example: _'add contact 919876543210 John'_"
+        )
+    phone = phone_match.group()
+    # Extract name — everything after the phone number
+    name_part = prompt[prompt.index(phone) + len(phone):].strip()
+    name = name_part if name_part else phone
+
+    add_contact(owner=sender, phone=phone, name=name)
+    return (
+        f"✅ Contact saved!\n"
+        f"👤 Name: {name}\n"
+        f"📞 Phone: +{phone}\n\n"
+        f"Type *my contacts* to see all contacts.\n"
+        f"To broadcast: _'broadcast: Your message here'_"
+    )
+
+
+def handle_list_contacts(sender: str) -> str:
+    contacts = get_contacts(sender)
+    if not contacts:
+        return (
+            "📭 No contacts saved yet!\n\n"
+            "Add one: _'add contact 919876543210 John'_"
+        )
+    lines = [f"👥 *Your Contacts ({len(contacts)}):*\n"]
+    for phone, name in contacts:
+        lines.append(f"👤 {name} — +{phone}")
+    lines.append("\n_To remove: 'remove contact 919876543210'_")
+    lines.append("_To broadcast: 'broadcast: Your message'_")
+    return "\n".join(lines)
+
+
+def handle_remove_contact(sender: str, prompt: str) -> str:
+    import re
+    phone_match = re.search(r'\d{10,15}', prompt)
+    if not phone_match:
+        return "Please include the phone number.\nExample: _'remove contact 919876543210'_"
+    phone   = phone_match.group()
+    deleted = remove_contact(owner=sender, phone=phone)
+    if deleted:
+        return f"✅ Contact +{phone} removed!\n\nType *my contacts* to see remaining contacts."
+    return f"❌ Contact +{phone} not found in your list.\nType *my contacts* to see saved contacts."
+
+
+def handle_broadcast(sender: str, prompt: str) -> str:
+    """Extract message after 'broadcast:' and send to all contacts."""
+    # Extract message after broadcast keyword
+    message = ""
+    for kw in BROADCAST_KEYWORDS:
+        if kw in prompt.lower():
+            idx     = prompt.lower().index(kw)
+            message = prompt[idx + len(kw):].strip()
+            break
+
+    if not message:
+        return (
+            "Please include a message after 'broadcast:'.\n"
+            "Example: _'broadcast: Team meeting at 10am tomorrow'_"
+        )
+
+    contacts = get_contacts(sender)
+    if not contacts:
+        return (
+            "📭 No contacts to broadcast to!\n\n"
+            "First add contacts: _'add contact 919876543210 John'_"
+        )
+
+    success_count = 0
+    fail_count    = 0
+
+    for phone, name in contacts:
+        try:
+            send_whatsapp_text(
+                phone_number=phone,
+                message=f"📢 *Announcement:*\n{message}",
+            )
+            success_count += 1
+            logger.info("[BROADCAST] ✅ Sent to %s (%s)", name, phone)
+            time.sleep(0.5)  # small delay to avoid rate limiting
+        except Exception as exc:
+            fail_count += 1
+            logger.error("[BROADCAST] ❌ Failed to %s (%s): %s", name, phone, exc)
+
+    result = f"📢 *Broadcast Complete!*\n\n"
+    result += f"✅ Sent to: {success_count} contact(s)\n"
+    if fail_count:
+        result += f"❌ Failed: {fail_count} contact(s)\n"
+    result += f"\n📝 Message: _{message}_"
+    return result
 
 
 def handle_list_reminders(sender: str) -> str:
