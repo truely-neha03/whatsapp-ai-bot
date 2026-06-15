@@ -887,8 +887,36 @@ def generate_ai_reply(prompt: str, sender: str) -> str:
         return "Sorry, AI is not configured correctly."
 
     try:
-        p_lower = prompt.lower()
+        p_lower  = prompt.lower().strip()
 
+        # ── STRICT COMMAND DETECTION (checked before AI) ──────────────────────
+        # These are checked by startswith so AI never intercepts them
+
+        if p_lower.startswith("add contact"):
+            logger.info("[AI] Add contact command from %s", sender)
+            return handle_add_contact(sender, prompt)
+
+        if p_lower.startswith("remove contact") or p_lower.startswith("delete contact"):
+            logger.info("[AI] Remove contact command from %s", sender)
+            return handle_remove_contact(sender, prompt)
+
+        if p_lower.startswith("my contacts") or p_lower.startswith("show contacts") or p_lower.startswith("list contacts"):
+            logger.info("[AI] List contacts command from %s", sender)
+            return handle_list_contacts(sender)
+
+        if p_lower.startswith("broadcast:") or p_lower.startswith("broadcast :"):
+            logger.info("[AI] Broadcast command from %s", sender)
+            return handle_broadcast(sender, prompt)
+
+        if p_lower.startswith("my reminders") or p_lower.startswith("show reminders") or p_lower.startswith("list reminders"):
+            logger.info("[AI] List reminders command from %s", sender)
+            return handle_list_reminders(sender)
+
+        if p_lower.startswith("cancel reminder") or p_lower.startswith("delete reminder"):
+            logger.info("[AI] Cancel reminder command from %s", sender)
+            return handle_cancel_reminder(sender, prompt)
+
+        # ── FUZZY KEYWORD DETECTION (for natural language) ────────────────────
         # ── List reminders ────────────────────────────────────────────────────
         if any(kw in p_lower for kw in LIST_KEYWORDS):
             logger.info("[AI] List reminders request from %s", sender)
@@ -898,6 +926,26 @@ def generate_ai_reply(prompt: str, sender: str) -> str:
         if any(kw in p_lower for kw in CANCEL_KEYWORDS):
             logger.info("[AI] Cancel reminder request from %s", sender)
             return handle_cancel_reminder(sender, prompt)
+
+        # ── Add contact ───────────────────────────────────────────────────────
+        if any(kw in p_lower for kw in ADD_CONTACT_KEYWORDS):
+            logger.info("[AI] Add contact request from %s", sender)
+            return handle_add_contact(sender, prompt)
+
+        # ── List contacts ─────────────────────────────────────────────────────
+        if any(kw in p_lower for kw in LIST_CONTACT_KEYWORDS):
+            logger.info("[AI] List contacts request from %s", sender)
+            return handle_list_contacts(sender)
+
+        # ── Remove contact ────────────────────────────────────────────────────
+        if any(kw in p_lower for kw in REMOVE_CONTACT_KEYWORDS):
+            logger.info("[AI] Remove contact request from %s", sender)
+            return handle_remove_contact(sender, prompt)
+
+        # ── Broadcast ─────────────────────────────────────────────────────────
+        if any(kw in p_lower for kw in BROADCAST_KEYWORDS):
+            logger.info("[AI] Broadcast request from %s", sender)
+            return handle_broadcast(sender, prompt)
 
         # ── Reminder path ─────────────────────────────────────────────────────
         if any(kw in p_lower for kw in REMINDER_KEYWORDS):
@@ -1111,7 +1159,7 @@ async def dashboard():
     try:
         now_ist = datetime.now(IST).strftime("%d %b %Y %I:%M:%S %p IST")
 
-        # Fetch all reminders
+        # Fetch all reminders and contacts
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -1119,6 +1167,8 @@ async def dashboard():
                     FROM reminders ORDER BY sent ASC, remind_at ASC
                 """)
                 all_reminders = cur.fetchall()
+                cur.execute("SELECT COUNT(*) FROM contacts")
+                total_contacts = cur.fetchone()[0]
 
         pending   = [r for r in all_reminders if not r[5]]
         completed = [r for r in all_reminders if r[5]]
@@ -1198,8 +1248,8 @@ async def dashboard():
                 <div class="label">🔁 Recurring Active</div>
             </div>
             <div class="card">
-                <div class="num">{len(conversation_history)}</div>
-                <div class="label">💬 Active Users</div>
+                <div class="num">{total_contacts}</div>
+                <div class="label">👥 Broadcast Contacts</div>
             </div>
         </div>
 
