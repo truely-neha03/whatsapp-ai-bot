@@ -304,6 +304,17 @@ def get_upcoming_reminders(limit: int = 5):
     return rows
 
 
+def get_reminder_counts():
+    """Return (pending, total) counts for health check."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM reminders WHERE sent = FALSE")
+            pending = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM reminders")
+            total = cur.fetchone()[0]
+    return pending, total
+
+
 init_db()
 
 
