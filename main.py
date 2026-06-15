@@ -1150,6 +1150,108 @@ async def health():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MOBILE APP API ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/api/reminders")
+async def api_get_reminders():
+    """Get all reminders for mobile app."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, phone, task, remind_at, recurrence, sent
+                FROM reminders ORDER BY sent ASC, remind_at ASC
+            """)
+            rows = cur.fetchall()
+    return [
+        {
+            "id": r[0], "phone": r[1], "task": r[2],
+            "remind_at": str(r[3]), "recurrence": r[4] or "none",
+            "sent": r[5], "call_status": "Completed" if r[5] else "Pending",
+        }
+        for r in rows
+    ]
+
+
+@app.delete("/api/reminders/{reminder_id}")
+async def api_delete_reminder(reminder_id: int):
+    """Cancel a reminder from mobile app."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM reminders WHERE id = %s", (reminder_id,))
+            deleted = cur.rowcount > 0
+        conn.commit()
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Reminder not found")
+    return {"status": "deleted"}
+
+
+@app.patch("/api/reminders/{reminder_id}")
+async def api_update_reminder(reminder_id: int, body: Dict[str, Any]):
+    """Edit a reminder from mobile app."""
+    task      = body.get("task")
+    remind_at = body.get("remind_at")
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE reminders SET task = %s, remind_at = %s WHERE id = %s",
+                (task, remind_at, reminder_id),
+            )
+        conn.commit()
+    return {"status": "updated"}
+
+
+@app.get("/api/contacts/{owner}")
+async def api_get_contacts(owner: str):
+    """Get contacts for mobile app."""
+    rows = get_contacts(owner)
+    return [{"phone": r[0], "name": r[1]} for r in rows]
+
+
+@app.post("/api/contacts")
+async def api_add_contact(body: Dict[str, Any]):
+    """Add contact from mobile app."""
+    add_contact(
+        owner=body.get("owner"),
+        phone=body.get("phone"),
+        name=body.get("name"),
+    )
+    return {"status": "saved"}
+
+
+@app.delete("/api/contacts/{owner}/{phone}")
+async def api_delete_contact(owner: str, phone: str):
+    """Remove contact from mobile app."""
+    deleted = remove_contact(owner=owner, phone=phone)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Contact not found")
+    return {"status": "deleted"}
+
+
+@app.post("/api/broadcast")
+async def api_broadcast(body: Dict[str, Any]):
+    """Broadcast from mobile app to selected contacts."""
+    owner   = body.get("owner")
+    message = body.get("message")
+    phones  = body.get("phones", [])
+
+    if not message or not phones:
+        raise HTTPException(status_code=400, detail="message and phones required")
+
+    success = 0
+    failed  = 0
+    for phone in phones:
+        try:
+            send_whatsapp_text(phone_number=phone, message=f"📢 *Announcement:*\n{message}")
+            success += 1
+            time.sleep(0.5)
+        except Exception as exc:
+            logger.error("[API_BROADCAST] Failed to %s: %s", phone, exc)
+            failed += 1
+
+    return {"status": "done", "success": success, "failed": failed}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # DASHBOARD
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/dashboard")
