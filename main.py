@@ -490,46 +490,96 @@ def make_twilio_call(phone: str, task: str):
         logger.error("[CALL] ❌ Call failed: %s", exc)
 
 
-DEVICE_PUSH_TOKEN = os.getenv("DEVICE_PUSH_TOKEN", "")
+FIREBASE_PROJECT_ID  = os.getenv("FIREBASE_PROJECT_ID", "")
+FIREBASE_CLIENT_EMAIL = os.getenv("FIREBASE_CLIENT_EMAIL", "")
+FIREBASE_PRIVATE_KEY  = os.getenv("FIREBASE_PRIVATE_KEY", "").replace("\\n", "\n")
+DEVICE_PUSH_TOKEN     = os.getenv("DEVICE_PUSH_TOKEN", "")
+
+
+def get_fcm_access_token() -> str:
+    """Get OAuth2 access token for FCM V1 API using service account."""
+    import json
+    import time
+    import base64
+    import hmac
+    import hashlib
+
+    # Build JWT
+    now = int(time.time())
+    header  = base64.urlsafe_b64encode(json.dumps({"alg": "RS256", "typ": "JWT"}).encode()).rstrip(b'=').decode()
+    payload = base64.urlsafe_b64encode(json.dumps({
+        "iss": FIREBASE_CLIENT_EMAIL,
+        "scope": "https://www.googleapis.com/auth/firebase.messaging",
+        "aud": "https://oauth2.googleapis.com/token",
+        "exp": now + 3600,
+        "iat": now,
+    }).encode()).rstrip(b'=').decode()
+
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+    from cryptography.hazmat.backends import default_backend
+
+    private_key = serialization.load_pem_private_key(
+        FIREBASE_PRIVATE_KEY.encode(),
+        password=None,
+        backend=default_backend(),
+    )
+    signing_input = f"{header}.{payload}".encode()
+    signature = private_key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+    sig_b64 = base64.urlsafe_b64encode(signature).rstrip(b'=').decode()
+    jwt_token = f"{header}.{payload}.{sig_b64}"
+
+    # Exchange JWT for access token
+    resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "assertion": jwt_token,
+        },
+        timeout=10,
+    )
+    return resp.json().get("access_token", "")
 
 
 def send_push_notification(task: str, phone: str):
-    """Send FCM push notification to trigger auto-call on device."""
-    if not DEVICE_PUSH_TOKEN:
-        logger.warning("[PUSH] DEVICE_PUSH_TOKEN not set — skipping push")
+    """Send FCM V1 push notification to trigger auto-call on device."""
+    if not DEVICE_PUSH_TOKEN or not FIREBASE_PROJECT_ID:
+        logger.warning("[PUSH] Firebase not configured — skipping push")
         return
     try:
+        access_token = get_fcm_access_token()
+        url = f"https://fcm.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/messages:send"
         payload = {
-            "to": DEVICE_PUSH_TOKEN,
-            "priority": "high",
-            "data": {
-                "type": "REMINDER",
-                "task": task,
-                "phone": phone,
-            },
-            "notification": {
-                "title": "⏰ Reminder",
-                "body": task,
-                "sound": "default",
-            },
-            "android": {
-                "priority": "high",
-                "notification": {
-                    "sound": "default",
-                    "channel_id": "reminders",
+            "message": {
+                "token": DEVICE_PUSH_TOKEN,
+                "data": {
+                    "type": "REMINDER",
+                    "task": task,
+                    "phone": phone,
                 },
-            },
+                "notification": {
+                    "title": "⏰ Reminder",
+                    "body": task,
+                },
+                "android": {
+                    "priority": "HIGH",
+                    "notification": {
+                        "sound": "default",
+                        "channel_id": "reminders",
+                    },
+                },
+            }
         }
         resp = requests.post(
-            "https://fcm.googleapis.com/fcm/send",
+            url,
             headers={
+                "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json",
-                "Authorization": f"key={os.getenv('FCM_SERVER_KEY', '')}",
             },
             json=payload,
             timeout=10,
         )
-        logger.info("[PUSH] ✅ Notification sent: %s", resp.status_code)
+        logger.info("[PUSH] ✅ FCM V1 sent: %s %s", resp.status_code, resp.text[:100])
     except Exception as exc:
         logger.error("[PUSH] ❌ Failed: %s", exc)
 
