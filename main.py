@@ -490,11 +490,61 @@ def make_twilio_call(phone: str, task: str):
         logger.error("[CALL] ❌ Call failed: %s", exc)
 
 
+DEVICE_PUSH_TOKEN = os.getenv("DEVICE_PUSH_TOKEN", "")
+
+
+def send_push_notification(task: str, phone: str):
+    """Send FCM push notification to trigger auto-call on device."""
+    if not DEVICE_PUSH_TOKEN:
+        logger.warning("[PUSH] DEVICE_PUSH_TOKEN not set — skipping push")
+        return
+    try:
+        payload = {
+            "to": DEVICE_PUSH_TOKEN,
+            "priority": "high",
+            "data": {
+                "type": "REMINDER",
+                "task": task,
+                "phone": phone,
+            },
+            "notification": {
+                "title": "⏰ Reminder",
+                "body": task,
+                "sound": "default",
+            },
+            "android": {
+                "priority": "high",
+                "notification": {
+                    "sound": "default",
+                    "channel_id": "reminders",
+                },
+            },
+        }
+        resp = requests.post(
+            "https://fcm.googleapis.com/fcm/send",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"key={os.getenv('FCM_SERVER_KEY', '')}",
+            },
+            json=payload,
+            timeout=10,
+        )
+        logger.info("[PUSH] ✅ Notification sent: %s", resp.status_code)
+    except Exception as exc:
+        logger.error("[PUSH] ❌ Failed: %s", exc)
+
+
 def send_reminder_with_voice(phone: str, task: str):
     """
-    Send reminder as text + WhatsApp voice note + phone call.
+    Send reminder as text + WhatsApp voice note + phone call + push notification.
     Each step is independent — if one fails, others still go through.
     """
+    # 0. Send push notification to trigger auto-call on device
+    try:
+        send_push_notification(task=task, phone=phone)
+    except Exception as exc:
+        logger.error("[REMINDER] ❌ Push failed: %s", exc)
+
     # 1. Always send text first
     try:
         send_whatsapp_text(
