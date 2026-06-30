@@ -520,7 +520,7 @@ def send_push_notification(task: str, phone: str):
             json=payload,
             timeout=10,
         )
-        logger.info("[PUSH] ✅ Expo push sent: %s %s", resp.status_code, resp.text[:100])
+        logger.info("[PUSH] ✅ Expo push sent: %s %s", resp.status_code, resp.text)
     except Exception as exc:
         logger.error("[PUSH] ❌ Failed: %s", exc)
 
