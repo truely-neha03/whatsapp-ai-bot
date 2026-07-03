@@ -1213,6 +1213,27 @@ async def health():
 # ─────────────────────────────────────────────────────────────────────────────
 # MOBILE APP API ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
+@app.post("/api/reminders")
+async def api_create_reminder(body: Dict[str, Any]):
+    """Create a reminder from mobile app."""
+    phone      = body.get("phone")
+    task       = body.get("task")
+    remind_at  = body.get("remind_at")
+    recurrence = body.get("recurrence", "none")
+
+    if not phone or not task or not remind_at:
+        raise HTTPException(status_code=400, detail="phone, task and remind_at required")
+
+    try:
+        naive_dt = datetime.strptime(remind_at, "%Y-%m-%d %H:%M")
+        aware_dt = naive_dt.replace(tzinfo=IST)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid format. Use YYYY-MM-DD HH:MM")
+
+    save_reminder(phone=phone, task=task, remind_at=aware_dt, recurrence=recurrence)
+    return {"status": "saved ✅", "task": task, "remind_at": str(aware_dt)}
+
+
 @app.get("/api/reminders")
 async def api_get_reminders():
     """Get all reminders for mobile app."""
