@@ -1204,7 +1204,7 @@ async def health():
         "reminders_pending" : pending,
         "reminders_total"   : total,
         "upcoming_reminders": [
-            {"phone": r[0], "task": r[1], "remind_at": str(r[2])} for r in upcoming
+            {"phone": r[0], "task": r[1], "remind_at": (r[2].replace(tzinfo=IST).isoformat() if r[2] and r[2].tzinfo is None else str(r[2]))} for r in upcoming
         ],
         "users_in_memory"   : len(conversation_history),
     }
@@ -1213,6 +1213,18 @@ async def health():
 # ─────────────────────────────────────────────────────────────────────────────
 # MOBILE APP API ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
+def _to_iso(dt):
+    """Return an unambiguous ISO 8601 string with IST offset (e.g. 2026-03-07T08:37:00+05:30).
+    DB TIMESTAMP columns come back naive — assume they were stored as IST wall-clock time."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=IST)
+    else:
+        dt = dt.astimezone(IST)
+    return dt.isoformat()
+
+
 @app.post("/api/reminders")
 async def api_create_reminder(body: Dict[str, Any]):
     """Create a reminder from mobile app."""
@@ -1247,7 +1259,7 @@ async def api_get_reminders():
     return [
         {
             "id": r[0], "phone": r[1], "task": r[2],
-            "remind_at": str(r[3]), "recurrence": r[4] or "none",
+            "remind_at": _to_iso(r[3]), "recurrence": r[4] or "none",
             "sent": r[5], "call_status": "Completed" if r[5] else "Pending",
         }
         for r in rows
