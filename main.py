@@ -1253,7 +1253,7 @@ async def api_get_reminders():
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT id, phone, task, remind_at, recurrence, sent
-                FROM reminders ORDER BY sent ASC, remind_at ASC
+                FROM reminders ORDER BY remind_at DESC
             """)
             rows = cur.fetchall()
     return [
