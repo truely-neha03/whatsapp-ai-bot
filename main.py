@@ -145,25 +145,31 @@ def init_db():
 
 
 def save_reminder(phone: str, task: str, remind_at: datetime, recurrence: str = "none"):
-    """Store reminder. remind_at may be naive (assumed IST) or aware."""
+    """Store reminder. remind_at may be naive (assumed IST) or aware.
+    The `reminders.remind_at` column is TIMESTAMP WITHOUT TIME ZONE. If we insert
+    a timezone-aware datetime, psycopg2/Postgres will silently convert it to the
+    session's timezone (usually UTC) before storing it — shifting the wall-clock
+    time by the IST offset. To avoid that, always strip tzinfo right before the
+    INSERT so the exact IST wall-clock numbers are stored as-is."""
     if remind_at.tzinfo is None:
         remind_at = remind_at.replace(tzinfo=IST)
     else:
         remind_at = remind_at.astimezone(IST)
+    naive_remind_at = remind_at.replace(tzinfo=None)
 
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO reminders (phone, task, remind_at, recurrence) VALUES (%s, %s, %s, %s)",
-                (phone, task, remind_at, recurrence),
+                (phone, task, naive_remind_at, recurrence),
             )
         conn.commit()
-    logger.info("[DB] Saved reminder: '%s' at %s recurrence=%s for %s", task, remind_at, recurrence, phone)
+    logger.info("[DB] Saved reminder: '%s' at %s recurrence=%s for %s", task, naive_remind_at, recurrence, phone)
 
 
 def get_due_reminders():
     """Return reminders whose remind_at <= now (IST), not yet sent."""
-    now = datetime.now(IST)
+    now = datetime.now(IST).replace(tzinfo=None)  # naive IST wall-clock, matches column storage
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
