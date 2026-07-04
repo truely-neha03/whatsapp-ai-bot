@@ -1287,16 +1287,33 @@ async def api_delete_reminder(reminder_id: int):
 
 @app.patch("/api/reminders/{reminder_id}")
 async def api_update_reminder(reminder_id: int, body: Dict[str, Any]):
-    """Edit a reminder from mobile app."""
-    task      = body.get("task")
-    remind_at = body.get("remind_at")
+    """Edit a reminder from mobile app. Only updates fields actually provided —
+    e.g. snoozing sends only remind_at, and must not wipe out task (NOT NULL column)."""
+    fields = []
+    values: list = []
+
+    if "task" in body and body["task"] is not None:
+        fields.append("task = %s")
+        values.append(body["task"])
+
+    if "remind_at" in body and body["remind_at"] is not None:
+        fields.append("remind_at = %s")
+        values.append(body["remind_at"])
+
+    if not fields:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+
+    values.append(reminder_id)
+    query = f"UPDATE reminders SET {', '.join(fields)} WHERE id = %s"
+
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE reminders SET task = %s, remind_at = %s WHERE id = %s",
-                (task, remind_at, reminder_id),
-            )
+            cur.execute(query, tuple(values))
+            updated = cur.rowcount > 0
         conn.commit()
+
+    if not updated:
+        raise HTTPException(status_code=404, detail="Reminder not found")
     return {"status": "updated"}
 
 
