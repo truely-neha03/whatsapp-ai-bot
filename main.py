@@ -499,7 +499,7 @@ def make_twilio_call(phone: str, task: str):
 EXPO_PUSH_TOKEN = os.getenv("EXPO_PUSH_TOKEN", "")
 
 
-def send_push_notification(task: str, phone: str):
+def send_push_notification(task: str, phone: str, reminder_id: int | None = None):
     """Send push notification via Expo Push Service."""
     if not EXPO_PUSH_TOKEN:
         logger.warning("[PUSH] EXPO_PUSH_TOKEN not set — skipping push")
@@ -515,6 +515,7 @@ def send_push_notification(task: str, phone: str):
                 "type": "REMINDER",
                 "task": task,
                 "phone": phone,
+                "id": reminder_id,
             },
         }
         resp = requests.post(
@@ -531,14 +532,14 @@ def send_push_notification(task: str, phone: str):
         logger.error("[PUSH] ❌ Failed: %s", exc)
 
 
-def send_reminder_with_voice(phone: str, task: str):
+def send_reminder_with_voice(phone: str, task: str, reminder_id: int | None = None):
     """
     Send reminder as text + WhatsApp voice note + phone call + push notification.
     Each step is independent — if one fails, others still go through.
     """
     # 0. Send push notification to trigger auto-call on device
     try:
-        send_push_notification(task=task, phone=phone)
+        send_push_notification(task=task, phone=phone, reminder_id=reminder_id)
     except Exception as exc:
         logger.error("[REMINDER] ❌ Push failed: %s", exc)
 
@@ -583,7 +584,7 @@ def reminder_scheduler():
             for reminder_id, phone, task, remind_at, recurrence in due:
                 logger.info("[SCHEDULER] Firing reminder #%d → %s : %s (recurrence=%s)", reminder_id, phone, task, recurrence)
                 try:
-                    send_reminder_with_voice(phone=phone, task=task)
+                    send_reminder_with_voice(phone=phone, task=task, reminder_id=reminder_id)
 
                     if recurrence and recurrence != "none":
                         # Recurring — reschedule for next occurrence
