@@ -14,6 +14,7 @@ import logging
 import threading
 import time
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -31,7 +32,6 @@ import requests
 
 # ── PostgreSQL ────────────────────────────────────────────────────────────────
 import psycopg2
-from psycopg2.extras import RealDictCursor
 
 # ── Config ────────────────────────────────────────────────────────────────────
 GROQ_API_KEY      = os.getenv("GROQ_API_KEY", "")
@@ -112,34 +112,47 @@ def get_conn():
     return psycopg2.connect(DATABASE_URL)
 
 
+@contextmanager
+def db_cursor():
+    """Yield (conn, cur) for a fresh DB connection/cursor.
+    Caller is responsible for calling conn.commit() after writes.
+    Both connection and cursor are always closed on exit."""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        yield conn, cur
+    finally:
+        cur.close()
+        conn.close()
+
+
 def init_db():
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS reminders (
-                    id         SERIAL PRIMARY KEY,
-                    phone      TEXT NOT NULL,
-                    task       TEXT NOT NULL,
-                    remind_at  TIMESTAMP NOT NULL,
-                    recurrence TEXT DEFAULT 'none',
-                    sent       BOOLEAN DEFAULT FALSE,
-                    created_at TIMESTAMP DEFAULT NOW()
-                )
-            """)
-            cur.execute("""
-                ALTER TABLE reminders
-                ADD COLUMN IF NOT EXISTS recurrence TEXT DEFAULT 'none'
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS contacts (
-                    id         SERIAL PRIMARY KEY,
-                    owner      TEXT NOT NULL,
-                    phone      TEXT NOT NULL,
-                    name       TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    UNIQUE(owner, phone)
-                )
-            """)
+    with db_cursor() as (conn, cur):
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS reminders (
+                id         SERIAL PRIMARY KEY,
+                phone      TEXT NOT NULL,
+                task       TEXT NOT NULL,
+                remind_at  TIMESTAMP NOT NULL,
+                recurrence TEXT DEFAULT 'none',
+                sent       BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            ALTER TABLE reminders
+            ADD COLUMN IF NOT EXISTS recurrence TEXT DEFAULT 'none'
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS contacts (
+                id         SERIAL PRIMARY KEY,
+                owner      TEXT NOT NULL,
+                phone      TEXT NOT NULL,
+                name       TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(owner, phone)
+            )
+        """)
         conn.commit()
     logger.info("Database initialised ✅ (PostgreSQL)")
 
@@ -157,12 +170,11 @@ def save_reminder(phone: str, task: str, remind_at: datetime, recurrence: str = 
         remind_at = remind_at.astimezone(IST)
     naive_remind_at = remind_at.replace(tzinfo=None)
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO reminders (phone, task, remind_at, recurrence) VALUES (%s, %s, %s, %s)",
-                (phone, task, naive_remind_at, recurrence),
-            )
+    with db_cursor() as (conn, cur):
+        cur.execute(
+            "INSERT INTO reminders (phone, task, remind_at, recurrence) VALUES (%s, %s, %s, %s)",
+            (phone, task, naive_remind_at, recurrence),
+        )
         conn.commit()
     logger.info("[DB] Saved reminder: '%s' at %s recurrence=%s for %s", task, naive_remind_at, recurrence, phone)
 
@@ -170,21 +182,19 @@ def save_reminder(phone: str, task: str, remind_at: datetime, recurrence: str = 
 def get_due_reminders():
     """Return reminders whose remind_at <= now (IST), not yet sent."""
     now = datetime.now(IST).replace(tzinfo=None)  # naive IST wall-clock, matches column storage
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, phone, task, remind_at, recurrence FROM reminders "
-                "WHERE remind_at <= %s AND sent = FALSE ORDER BY remind_at",
-                (now,),
-            )
-            rows = cur.fetchall()
+    with db_cursor() as (conn, cur):
+        cur.execute(
+            "SELECT id, phone, task, remind_at, recurrence FROM reminders "
+            "WHERE remind_at <= %s AND sent = FALSE ORDER BY remind_at",
+            (now,),
+        )
+        rows = cur.fetchall()
     return rows
 
 
 def mark_sent(reminder_id: int):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("UPDATE reminders SET sent = TRUE WHERE id = %s", (reminder_id,))
+    with db_cursor() as (conn, cur):
+        cur.execute("UPDATE reminders SET sent = TRUE WHERE id = %s", (reminder_id,))
         conn.commit()
 
 
@@ -213,12 +223,11 @@ def reschedule_reminder(reminder_id: int, current_time: datetime, recurrence: st
     else:
         return  # not recurring
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE reminders SET remind_at = %s, sent = FALSE WHERE id = %s",
-                (next_time, reminder_id),
-            )
+    with db_cursor() as (conn, cur):
+        cur.execute(
+            "UPDATE reminders SET remind_at = %s, sent = FALSE WHERE id = %s",
+            (next_time, reminder_id),
+        )
         conn.commit()
     logger.info("[DB] Rescheduled #%d → next: %s (%s)", reminder_id, next_time, recurrence)
 
@@ -228,13 +237,12 @@ def reschedule_reminder(reminder_id: int, current_time: datetime, recurrence: st
 # ─────────────────────────────────────────────────────────────────────────────
 def add_contact(owner: str, phone: str, name: str) -> bool:
     try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO contacts (owner, phone, name) VALUES (%s, %s, %s) "
-                    "ON CONFLICT (owner, phone) DO UPDATE SET name = %s",
-                    (owner, phone, name, name),
-                )
+        with db_cursor() as (conn, cur):
+            cur.execute(
+                "INSERT INTO contacts (owner, phone, name) VALUES (%s, %s, %s) "
+                "ON CONFLICT (owner, phone) DO UPDATE SET name = %s",
+                (owner, phone, name, name),
+            )
             conn.commit()
         logger.info("[CONTACTS] Saved %s (%s) for %s", name, phone, owner)
         return True
@@ -244,80 +252,66 @@ def add_contact(owner: str, phone: str, name: str) -> bool:
 
 
 def get_contacts(owner: str) -> list:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT phone, name FROM contacts WHERE owner = %s ORDER BY name",
-                (owner,),
-            )
-            return cur.fetchall()
+    with db_cursor() as (conn, cur):
+        cur.execute(
+            "SELECT phone, name FROM contacts WHERE owner = %s ORDER BY name",
+            (owner,),
+        )
+        return cur.fetchall()
 
 
 def remove_contact(owner: str, phone: str) -> bool:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM contacts WHERE owner = %s AND phone = %s",
-                (owner, phone),
-            )
-            deleted = cur.rowcount > 0
+    with db_cursor() as (conn, cur):
+        cur.execute(
+            "DELETE FROM contacts WHERE owner = %s AND phone = %s",
+            (owner, phone),
+        )
+        deleted = cur.rowcount > 0
         conn.commit()
     return deleted
 
 
 def get_pending_reminders_for_user(phone: str):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, task, remind_at, recurrence FROM reminders "
-                "WHERE phone = %s AND sent = FALSE ORDER BY remind_at",
-                (phone,),
-            )
-            return cur.fetchall()
+    with db_cursor() as (conn, cur):
+        cur.execute(
+            "SELECT id, task, remind_at, recurrence FROM reminders "
+            "WHERE phone = %s AND sent = FALSE ORDER BY remind_at",
+            (phone,),
+        )
+        return cur.fetchall()
 
 
 def cancel_reminder_for_user(phone: str, reminder_id: int) -> bool:
     """Cancel a specific reminder for a user. Returns True if deleted."""
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM reminders WHERE id = %s AND phone = %s AND sent = FALSE",
-                (reminder_id, phone),
-            )
-            deleted = cur.rowcount > 0
+    with db_cursor() as (conn, cur):
+        cur.execute(
+            "DELETE FROM reminders WHERE id = %s AND phone = %s AND sent = FALSE",
+            (reminder_id, phone),
+        )
+        deleted = cur.rowcount > 0
         conn.commit()
     return deleted
-    """Return (pending, total) counts for health check."""
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM reminders WHERE sent = FALSE")
-            pending = cur.fetchone()[0]
-            cur.execute("SELECT COUNT(*) FROM reminders")
-            total = cur.fetchone()[0]
-    return pending, total
 
 
 def get_upcoming_reminders(limit: int = 5):
     """Return next N pending reminders for health check."""
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT phone, task, remind_at FROM reminders "
-                "WHERE sent = FALSE ORDER BY remind_at LIMIT %s",
-                (limit,),
-            )
-            rows = cur.fetchall()
+    with db_cursor() as (conn, cur):
+        cur.execute(
+            "SELECT phone, task, remind_at FROM reminders "
+            "WHERE sent = FALSE ORDER BY remind_at LIMIT %s",
+            (limit,),
+        )
+        rows = cur.fetchall()
     return rows
 
 
 def get_reminder_counts():
     """Return (pending, total) counts for health check."""
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM reminders WHERE sent = FALSE")
-            pending = cur.fetchone()[0]
-            cur.execute("SELECT COUNT(*) FROM reminders")
-            total = cur.fetchone()[0]
+    with db_cursor() as (conn, cur):
+        cur.execute("SELECT COUNT(*) FROM reminders WHERE sent = FALSE")
+        pending = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM reminders")
+        total = cur.fetchone()[0]
     return pending, total
 
 
@@ -1256,13 +1250,12 @@ async def api_create_reminder(body: Dict[str, Any]):
 @app.get("/api/reminders")
 async def api_get_reminders():
     """Get all reminders for mobile app."""
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, phone, task, remind_at, recurrence, sent
-                FROM reminders ORDER BY remind_at DESC
-            """)
-            rows = cur.fetchall()
+    with db_cursor() as (conn, cur):
+        cur.execute("""
+            SELECT id, phone, task, remind_at, recurrence, sent
+            FROM reminders ORDER BY remind_at DESC
+        """)
+        rows = cur.fetchall()
     return [
         {
             "id": r[0], "phone": r[1], "task": r[2],
@@ -1276,10 +1269,9 @@ async def api_get_reminders():
 @app.delete("/api/reminders/{reminder_id}")
 async def api_delete_reminder(reminder_id: int):
     """Cancel a reminder from mobile app."""
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM reminders WHERE id = %s", (reminder_id,))
-            deleted = cur.rowcount > 0
+    with db_cursor() as (conn, cur):
+        cur.execute("DELETE FROM reminders WHERE id = %s", (reminder_id,))
+        deleted = cur.rowcount > 0
         conn.commit()
     if not deleted:
         raise HTTPException(status_code=404, detail="Reminder not found")
@@ -1289,7 +1281,10 @@ async def api_delete_reminder(reminder_id: int):
 @app.patch("/api/reminders/{reminder_id}")
 async def api_update_reminder(reminder_id: int, body: Dict[str, Any]):
     """Edit a reminder from mobile app. Only updates fields actually provided —
-    e.g. snoozing sends only remind_at, and must not wipe out task (NOT NULL column)."""
+    e.g. snoozing sends only remind_at, and must not wipe out task (NOT NULL column).
+    Snoozing must also reset sent=FALSE, otherwise an already-fired reminder
+    (sent=TRUE) will never be picked up again by the scheduler, no matter what
+    remind_at is changed to."""
     fields = []
     values: list = []
 
@@ -1301,16 +1296,19 @@ async def api_update_reminder(reminder_id: int, body: Dict[str, Any]):
         fields.append("remind_at = %s")
         values.append(body["remind_at"])
 
+    if "sent" in body and body["sent"] is not None:
+        fields.append("sent = %s")
+        values.append(bool(body["sent"]))
+
     if not fields:
         raise HTTPException(status_code=400, detail="Nothing to update")
 
     values.append(reminder_id)
     query = f"UPDATE reminders SET {', '.join(fields)} WHERE id = %s"
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(query, tuple(values))
-            updated = cur.rowcount > 0
+    with db_cursor() as (conn, cur):
+        cur.execute(query, tuple(values))
+        updated = cur.rowcount > 0
         conn.commit()
 
     if not updated:
@@ -1380,15 +1378,14 @@ async def dashboard():
         now_ist = datetime.now(IST).strftime("%d %b %Y %I:%M:%S %p IST")
 
         # Fetch all reminders and contacts
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT id, phone, task, remind_at, recurrence, sent, created_at
-                    FROM reminders ORDER BY sent ASC, remind_at ASC
-                """)
-                all_reminders = cur.fetchall()
-                cur.execute("SELECT COUNT(*) FROM contacts")
-                total_contacts = cur.fetchone()[0]
+        with db_cursor() as (conn, cur):
+            cur.execute("""
+                SELECT id, phone, task, remind_at, recurrence, sent, created_at
+                FROM reminders ORDER BY sent ASC, remind_at ASC
+            """)
+            all_reminders = cur.fetchall()
+            cur.execute("SELECT COUNT(*) FROM contacts")
+            total_contacts = cur.fetchone()[0]
 
         pending   = [r for r in all_reminders if not r[5]]
         completed = [r for r in all_reminders if r[5]]
