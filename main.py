@@ -30,15 +30,21 @@ from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 
-# ── PostgreSQL ────────────────────────────────────────────────────────────────
-import psycopg2
+# ── MySQL ─────────────────────────────────────────────────────────────────────
+import pymysql
+import pymysql.cursors
+import pymysql.err
 
 # ── Config ────────────────────────────────────────────────────────────────────
 GROQ_API_KEY      = os.getenv("GROQ_API_KEY", "")
 WHATSAPP_TOKEN    = os.getenv("WHATSAPP_TOKEN", "")
 PHONE_NUMBER_ID   = os.getenv("PHONE_NUMBER_ID", "")
 VERIFY_TOKEN      = os.getenv("VERIFY_TOKEN", "my_secret_token_123")
-DATABASE_URL          = os.getenv("DATABASE_URL", "")
+MYSQL_HOST            = os.getenv("MYSQL_HOST", "localhost")
+MYSQL_PORT            = int(os.getenv("MYSQL_PORT", "3306"))
+MYSQL_USER            = os.getenv("MYSQL_USER", "root")
+MYSQL_PASSWORD        = os.getenv("MYSQL_PASSWORD", "")
+MYSQL_DB              = os.getenv("MYSQL_DB", "whatsapp_bot")
 TWILIO_ACCOUNT_SID    = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN     = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_PHONE_NUMBER   = os.getenv("TWILIO_PHONE_NUMBER", "")
@@ -105,18 +111,34 @@ app.add_middleware(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DATABASE — PostgreSQL (persistent, survives Railway restarts)
+# DATABASE — MySQL (local)
 # ─────────────────────────────────────────────────────────────────────────────
 def get_conn():
-    """Get a fresh PostgreSQL connection."""
-    return psycopg2.connect(DATABASE_URL)
+    """Get a fresh MySQL connection.
+    Uses a plain tuple cursor (pymysql.cursors.Cursor) — NOT DictCursor —
+    because existing code accesses row values by index (row[0], row[1], ...)."""
+    return pymysql.connect(
+        host=MYSQL_HOST,
+        port=MYSQL_PORT,
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        database=MYSQL_DB,
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.Cursor,
+    )
 
 
 @contextmanager
 def db_cursor():
     """Yield (conn, cur) for a fresh DB connection/cursor.
     Caller is responsible for calling conn.commit() after writes.
-    Both connection and cursor are always closed on exit."""
+    Both connection and cursor are always closed on exit.
+
+    NOTE: pymysql's Connection.__enter__ returns a cursor directly (not the
+    connection itself), unlike psycopg2, where `with get_conn() as conn:` then
+    `with conn.cursor() as cur:` works as expected. To avoid that
+    driver-specific incompatibility, we manage the connection/cursor
+    lifecycle ourselves here instead of relying on `with conn:`/`with cur:`."""
     conn = get_conn()
     cur = conn.cursor()
     try:
@@ -126,44 +148,57 @@ def db_cursor():
         conn.close()
 
 
+def _add_column_if_not_exists(cur, conn, table: str, ddl: str):
+    """Run an ALTER TABLE ADD COLUMN, tolerating MySQL error 1060
+    (duplicate column name) for compatibility with MySQL versions older
+    than 8.0.29 that don't support native ADD COLUMN IF NOT EXISTS."""
+    try:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+        conn.commit()
+    except pymysql.err.Error as exc:
+        if exc.args and exc.args[0] == 1060:
+            logger.info("[DB] Column already exists on %s (%s) — skipping", table, ddl)
+        else:
+            raise
+
+
 def init_db():
     with db_cursor() as (conn, cur):
         cur.execute("""
             CREATE TABLE IF NOT EXISTS reminders (
-                id         SERIAL PRIMARY KEY,
+                id         INT AUTO_INCREMENT PRIMARY KEY,
                 phone      TEXT NOT NULL,
                 task       TEXT NOT NULL,
-                remind_at  TIMESTAMP NOT NULL,
-                recurrence TEXT DEFAULT 'none',
+                remind_at  DATETIME NOT NULL,
+                recurrence VARCHAR(20) DEFAULT 'none',
                 sent       BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT NOW()
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        cur.execute("""
-            ALTER TABLE reminders
-            ADD COLUMN IF NOT EXISTS recurrence TEXT DEFAULT 'none'
-        """)
+        conn.commit()
+
+        _add_column_if_not_exists(cur, conn, "reminders", "recurrence VARCHAR(20) DEFAULT 'none'")
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS contacts (
-                id         SERIAL PRIMARY KEY,
-                owner      TEXT NOT NULL,
-                phone      TEXT NOT NULL,
+                id         INT AUTO_INCREMENT PRIMARY KEY,
+                owner      VARCHAR(30) NOT NULL,
+                phone      VARCHAR(20) NOT NULL,
                 name       TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT NOW(),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(owner, phone)
             )
         """)
         conn.commit()
-    logger.info("Database initialised ✅ (PostgreSQL)")
+    logger.info("Database initialised ✅ (MySQL)")
 
 
 def save_reminder(phone: str, task: str, remind_at: datetime, recurrence: str = "none"):
     """Store reminder. remind_at may be naive (assumed IST) or aware.
-    The `reminders.remind_at` column is TIMESTAMP WITHOUT TIME ZONE. If we insert
-    a timezone-aware datetime, psycopg2/Postgres will silently convert it to the
-    session's timezone (usually UTC) before storing it — shifting the wall-clock
-    time by the IST offset. To avoid that, always strip tzinfo right before the
-    INSERT so the exact IST wall-clock numbers are stored as-is."""
+    The `reminders.remind_at` column is a MySQL DATETIME (not TIMESTAMP), so it
+    stores exactly what we insert with no session/server timezone conversion.
+    We still strip tzinfo right before the INSERT so the exact IST wall-clock
+    numbers are what gets stored."""
     if remind_at.tzinfo is None:
         remind_at = remind_at.replace(tzinfo=IST)
     else:
@@ -240,8 +275,8 @@ def add_contact(owner: str, phone: str, name: str) -> bool:
         with db_cursor() as (conn, cur):
             cur.execute(
                 "INSERT INTO contacts (owner, phone, name) VALUES (%s, %s, %s) "
-                "ON CONFLICT (owner, phone) DO UPDATE SET name = %s",
-                (owner, phone, name, name),
+                "ON DUPLICATE KEY UPDATE name = VALUES(name)",
+                (owner, phone, name),
             )
             conn.commit()
         logger.info("[CONTACTS] Saved %s (%s) for %s", name, phone, owner)
@@ -1216,7 +1251,7 @@ async def health():
 # ─────────────────────────────────────────────────────────────────────────────
 def _to_iso(dt):
     """Return an unambiguous ISO 8601 string with IST offset (e.g. 2026-03-07T08:37:00+05:30).
-    DB TIMESTAMP columns come back naive — assume they were stored as IST wall-clock time."""
+    DB DATETIME columns come back naive — assume they were stored as IST wall-clock time."""
     if dt is None:
         return None
     if dt.tzinfo is None:
@@ -1474,7 +1509,7 @@ async def dashboard():
         <div class="status-bar">
             <div class="status-item">🤖 Bot: <span style="color:#28a745">RUNNING</span></div>
             <div class="status-item">🧠 AI: <span style="color:#28a745">{'ON' if groq_client else 'OFF'}</span></div>
-            <div class="status-item">🗄️ DB: <span style="color:#28a745">PostgreSQL</span></div>
+            <div class="status-item">🗄️ DB: <span style="color:#28a745">MySQL</span></div>
             <div class="status-item">🎙️ Voice: <span style="color:{'#28a745' if GTTS_AVAILABLE else '#dc3545'}">{'ON' if GTTS_AVAILABLE else 'OFF'}</span></div>
             <div class="status-item">📞 Calls: <span style="color:{'#28a745' if TWILIO_AVAILABLE and TWILIO_ACCOUNT_SID else '#dc3545'}">{'ON' if TWILIO_AVAILABLE and TWILIO_ACCOUNT_SID else 'OFF'}</span></div>
         </div>

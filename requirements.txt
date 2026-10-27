@@ -4,6 +4,6 @@ python-dotenv
 requests
 groq
 gtts
-psycopg2-binary
+pymysql
 twilio
 cryptography
